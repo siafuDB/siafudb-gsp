@@ -3,6 +3,14 @@
 // THE LOCAL DISCOVERY ENGINE
 //
 // Manages the mDNS service registration and listener for this
+//
+// NOTE: the allow(dead_code, unused_imports) below covers imports and
+// fields used by the mDNS implementation that lands once the discovery
+// engine is fleshed out. Remove the allow once the TODO bodies are real.
+
+#![allow(dead_code, unused_imports)]
+
+// Manages the mDNS service registration and listener for this
 // SiafuDB instance. Automatically discovers peers on the local
 // network and initiates sync when appropriate.
 //

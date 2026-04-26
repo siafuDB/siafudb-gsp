@@ -1,5 +1,11 @@
 // siafudb-sync/src/adapters/gspa.rs
 //
+// NOTE: the GspaAdapter.cursor field is consumed by the pull_http /
+// pull_websocket / pull_grpc / pull_kafka bodies that arrive in M4.
+// Remove the allow once those transport methods are implemented.
+
+#![allow(dead_code, unused_imports)]
+
 // GSPA — Graph Sync Protocol with API
 //
 // The traditional adapter. Request-response transport over HTTP/gRPC/WebSocket.

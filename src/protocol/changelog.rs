@@ -1,5 +1,13 @@
 // siafudb-sync/src/protocol/changelog.rs
 //
+// NOTE: this is the protocol-layer change log (cursors, mutation
+// metadata) that pairs with siafudb-core's engine-level ChangeLog.
+// The Mutation import below is staged for the M4 translation layer
+// that turns engine ChangeLogEntry into a transport-ready Mutation.
+// Remove the allow once M4 lands and the import becomes load-bearing.
+
+#![allow(dead_code, unused_imports)]
+
 // THE CHANGE LOG
 //
 // The change log is an append-only sequence of mutations produced by

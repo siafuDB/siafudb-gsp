@@ -1,5 +1,10 @@
 // siafudb-sync/src/protocol/mutation.rs
 //
+// NOTE: VectorClock and related imports are staged for the M4 mutation
+// translation layer. Remove the allow once those bodies populate.
+
+#![allow(dead_code, unused_imports)]
+
 // The Mutation is the fundamental unit of the Graph Sync Protocol.
 //
 // When a SiafuDB instance modifies its graph — creating a node, adding

@@ -1,5 +1,13 @@
 // siafudb-sync/src/protocol/channel.rs
 //
+// NOTE: the InProcessChannel struct fields (name, relationship, tx, rx)
+// and the VectorClock / ProjectedMutation / SyncCursor imports are used
+// by the channel send/recv implementation that arrives with the M4
+// mutation-translation work and the M3 follow-on bidirectional sync.
+// Remove the allow once those code paths are live.
+
+#![allow(dead_code, unused_imports)]
+
 // THE GRAPH SYNC CHANNEL
 //
 // This is the universal primitive that the entire Graph Sync Protocol

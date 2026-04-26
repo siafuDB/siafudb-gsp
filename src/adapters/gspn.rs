@@ -1,5 +1,10 @@
 // siafudb-sync/src/adapters/gspn.rs
 //
+// NOTE: Mutation import is staged for M5 (signal emission/reception
+// through NTL). Remove the allow once that body populates.
+
+#![allow(dead_code, unused_imports)]
+
 // GSPN — Graph Sync Protocol with NTL
 //
 // The signal-native adapter. SiafuDB becomes a neuron in the NTL network.

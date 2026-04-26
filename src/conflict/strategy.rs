@@ -1,4 +1,10 @@
 // siafudb-sync/src/conflict/strategy.rs
+//
+// NOTE: CausalOrder, Mutation, and VectorClock imports are staged for
+// the conflict-resolution apply path that lands with M4. Remove the
+// allow once that body populates.
+
+#![allow(dead_code, unused_imports)]
 
 use crate::protocol::mutation::{CausalOrder, Mutation, VectorClock};
 use serde::{Deserialize, Serialize};

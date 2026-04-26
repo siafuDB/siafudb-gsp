@@ -1,5 +1,11 @@
 // siafudb-sync/src/protocol/transform.rs
 //
+// NOTE: VectorClock and NodeIdentity imports are staged for M4 (when
+// outbound mutations are signed and ordered) and M5 (NTL signal-level
+// identity). Remove the allow once those bodies populate.
+
+#![allow(dead_code, unused_imports)]
+
 // THE TRANSFORMATION LAYER
 //
 // This is the layer that makes the Graph Sync Protocol more than just

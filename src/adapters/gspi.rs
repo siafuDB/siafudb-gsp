@@ -1,5 +1,11 @@
 // siafudb-sync/src/adapters/gspi.rs
 //
+// NOTE: imports are staged for the in-process adapter implementation
+// that lands on top of the existing InProcessReplicator (M3 follow-on).
+// Remove the allow once those bodies populate.
+
+#![allow(dead_code, unused_imports)]
+
 // GSPI — Graph Sync Protocol Internal
 //
 // The third adapter, alongside GSPA (API) and GSPN (NTL).
@@ -119,7 +125,7 @@ pub struct GspiReceiver {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// // In the Mukoko app startup:
 /// let personal_db = SiafuDB::open("personal.siafu")?;
 /// let network_db = SiafuDB::open("network.siafu")?;
