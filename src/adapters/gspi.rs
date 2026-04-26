@@ -41,12 +41,12 @@
 // GSPI represents the theoretical minimum cost of sync — the cost
 // of the protocol logic itself with zero transport overhead.
 
-use crate::protocol::{MutationBatch, VectorClock};
 use crate::protocol::transform::{
     ProjectedMutation, SyncRelationship, TransformEngine, TransformRule,
 };
-use siafudb_core::error::SiafuError;
+use crate::protocol::{MutationBatch, VectorClock};
 use serde::{Deserialize, Serialize};
+use siafudb_core::error::SiafuError;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -212,13 +212,12 @@ impl GspiSender {
 
         // Send each projected mutation through the channel.
         for mutation in mutations {
-            self.tx
-                .send(mutation)
-                .await
-                .map_err(|e| SiafuError::SyncError(format!(
+            self.tx.send(mutation).await.map_err(|e| {
+                SiafuError::SyncError(format!(
                     "GSPI channel closed for '{}': {}",
                     self.config.name, e
-                )))?;
+                ))
+            })?;
         }
 
         Ok(())
@@ -237,12 +236,12 @@ impl GspiSender {
         };
 
         for mutation in mutations {
-            self.tx
-                .try_send(mutation)
-                .map_err(|e| SiafuError::SyncError(format!(
+            self.tx.try_send(mutation).map_err(|e| {
+                SiafuError::SyncError(format!(
                     "GSPI channel full for '{}': {}",
                     self.config.name, e
-                )))?;
+                ))
+            })?;
         }
 
         Ok(())

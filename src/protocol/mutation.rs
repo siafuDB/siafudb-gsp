@@ -197,11 +197,8 @@ impl VectorClock {
         let mut other_gte_self = true;
 
         // Check all keys from both clocks
-        let all_keys: std::collections::HashSet<_> = self
-            .entries
-            .keys()
-            .chain(other.entries.keys())
-            .collect();
+        let all_keys: std::collections::HashSet<_> =
+            self.entries.keys().chain(other.entries.keys()).collect();
 
         for key in all_keys {
             let self_val = self.entries.get(key).copied().unwrap_or(0);

@@ -23,9 +23,7 @@ fn one_way_replication_carries_writes_across() {
     let applied = replicator.replicate(&db_a, &db_b).unwrap();
     assert_eq!(applied, 2);
 
-    let result = db_b
-        .query("MATCH (p:Person) RETURN p.name")
-        .unwrap();
+    let result = db_b.query("MATCH (p:Person) RETURN p.name").unwrap();
     assert_eq!(
         result.rows.len(),
         2,
@@ -53,8 +51,6 @@ fn cursor_advances_so_replays_only_carry_new_entries() {
     assert_eq!(second, 1, "only the new entry is applied");
     assert_eq!(replicator.cursor(), 2);
 
-    let result = db_b
-        .query("MATCH (p:Person) RETURN p.name")
-        .unwrap();
+    let result = db_b.query("MATCH (p:Person) RETURN p.name").unwrap();
     assert_eq!(result.rows.len(), 2);
 }

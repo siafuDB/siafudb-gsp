@@ -19,7 +19,7 @@
 // the sync engine "I found a peer, here's their info, you decide
 // what to do."
 
-use super::announcement::{PeerAnnouncement, MDNS_SERVICE_TYPE};
+use super::announcement::{MDNS_SERVICE_TYPE, PeerAnnouncement};
 use siafudb_core::error::SiafuError;
 use siafudb_core::fragment::FragmentKind;
 use std::collections::HashMap;

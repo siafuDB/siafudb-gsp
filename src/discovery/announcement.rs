@@ -75,10 +75,7 @@ impl PeerAnnouncement {
             ("kind".to_string(), format!("{:?}", self.fragment_kind)),
             ("port".to_string(), self.sync_port.to_string()),
             ("proto".to_string(), self.protocol_version.clone()),
-            (
-                "adapters".to_string(),
-                self.supported_adapters.join(","),
-            ),
+            ("adapters".to_string(), self.supported_adapters.join(",")),
         ];
 
         if let Some(name) = &self.device_name {

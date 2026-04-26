@@ -48,8 +48,8 @@
 // from GSPA to GSPN as NTL matures. Both coexist indefinitely.
 
 use crate::protocol::{Mutation, MutationBatch};
-use siafudb_core::error::SiafuError;
 use serde::{Deserialize, Serialize};
+use siafudb_core::error::SiafuError;
 use uuid::Uuid;
 
 /// Configuration for a GSPN sync connection.

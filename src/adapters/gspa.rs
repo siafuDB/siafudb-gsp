@@ -4,7 +4,7 @@
 // pull_websocket / pull_grpc / pull_kafka bodies that arrive in M4.
 // Remove the allow once those transport methods are implemented.
 
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, rustdoc::bare_urls)]
 
 // GSPA — Graph Sync Protocol with API
 //
@@ -28,11 +28,11 @@
 // But GSPA never goes away, because there will always be systems
 // that speak HTTP and never adopt NTL.
 
-use crate::protocol::{MutationBatch, VectorClock};
 use crate::protocol::changelog::SyncCursor;
-use crate::protocol::transform::{SyncRelationship, TransformEngine, ProjectedMutation};
-use siafudb_core::error::SiafuError;
+use crate::protocol::transform::{ProjectedMutation, SyncRelationship, TransformEngine};
+use crate::protocol::{MutationBatch, VectorClock};
 use serde::{Deserialize, Serialize};
+use siafudb_core::error::SiafuError;
 use uuid::Uuid;
 
 /// Configuration for a GSPA sync relationship.

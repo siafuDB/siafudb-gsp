@@ -24,19 +24,18 @@
 //    The HTTP adapter is for legacy/API compatibility. The JanusGraph
 //    adapter enables sync with the server-side platform graph.
 
-pub mod mutation;
 pub mod changelog;
-pub mod transform;
 pub mod channel;
+pub mod mutation;
+pub mod transform;
 
-pub use mutation::{Mutation, MutationType, MutationBatch, VectorClock, CausalOrder};
 pub use changelog::{ChangeLog, ChangeLogEntry, SyncCursor};
-pub use transform::{
-    SyncRelationship, SyncDirection, TransformRule, TransformEngine,
-    ProjectedMutation, AggregationType, FilterOperator,
-};
 pub use channel::{
-    SyncChannel, ChannelTransport, ChannelConfig, TransportConfig,
-    InProcessChannel, InProcessSender, InProcessReceiver,
-    create_in_process_pair, create_in_process_channel,
+    ChannelConfig, ChannelTransport, InProcessChannel, InProcessReceiver, InProcessSender,
+    SyncChannel, TransportConfig, create_in_process_channel, create_in_process_pair,
+};
+pub use mutation::{CausalOrder, Mutation, MutationBatch, MutationType, VectorClock};
+pub use transform::{
+    AggregationType, FilterOperator, ProjectedMutation, SyncDirection, SyncRelationship,
+    TransformEngine, TransformRule,
 };

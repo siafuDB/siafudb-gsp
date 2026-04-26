@@ -51,13 +51,13 @@
 // share the same primitive, which eliminates impedance mismatch between
 // the database and the transfer layer.
 
+use super::changelog::SyncCursor;
 use super::mutation::{MutationBatch, VectorClock};
 use super::transform::{
-    ProjectedMutation, SyncRelationship, TransformEngine, TransformRule, SyncDirection,
+    ProjectedMutation, SyncDirection, SyncRelationship, TransformEngine, TransformRule,
 };
-use super::changelog::SyncCursor;
-use siafudb_core::error::SiafuError;
 use serde::{Deserialize, Serialize};
+use siafudb_core::error::SiafuError;
 use std::fmt;
 use uuid::Uuid;
 
@@ -303,14 +303,14 @@ pub fn create_in_process_pair(
     let channel_a = InProcessChannel {
         name: name_a_to_b.to_string(),
         relationship: build_relationship(name_a_to_b, &rules_a_to_b),
-        tx: tx_b, // A sends to B's receiver
+        tx: tx_b,                          // A sends to B's receiver
         rx: tokio::sync::Mutex::new(rx_a), // A receives from B's sender
     };
 
     let channel_b = InProcessChannel {
         name: name_b_to_a.to_string(),
         relationship: build_relationship(name_b_to_a, &rules_b_to_a),
-        tx: tx_a, // B sends to A's receiver
+        tx: tx_a,                          // B sends to A's receiver
         rx: tokio::sync::Mutex::new(rx_b), // B receives from A's sender
     };
 
@@ -388,9 +388,7 @@ impl InProcessSender {
         self.tx
             .send(projected_batch)
             .await
-            .map_err(|e| SiafuError::SyncError(format!(
-                "Channel '{}' closed: {}", self.name, e
-            )))?;
+            .map_err(|e| SiafuError::SyncError(format!("Channel '{}' closed: {}", self.name, e)))?;
 
         Ok(())
     }
@@ -411,9 +409,7 @@ impl InProcessSender {
 
         self.tx
             .try_send(projected_batch)
-            .map_err(|e| SiafuError::SyncError(format!(
-                "Channel '{}' full: {}", self.name, e
-            )))?;
+            .map_err(|e| SiafuError::SyncError(format!("Channel '{}' full: {}", self.name, e)))?;
 
         Ok(())
     }
