@@ -196,6 +196,9 @@ impl GspaAdapter {
             GspaTransport::WebSocket => self.send_websocket(&payload).await,
             GspaTransport::Grpc => self.send_grpc(&payload).await,
             GspaTransport::Kafka { .. } => self.send_kafka(&payload).await,
+            GspaTransport::Local => Err(SiafuError::SyncError(
+                "GSPA local transport not yet implemented".into(),
+            )),
         }
     }
 
@@ -210,6 +213,9 @@ impl GspaAdapter {
             GspaTransport::WebSocket => self.pull_websocket().await,
             GspaTransport::Grpc => self.pull_grpc().await,
             GspaTransport::Kafka { .. } => self.pull_kafka().await,
+            GspaTransport::Local => Err(SiafuError::SyncError(
+                "GSPA local transport not yet implemented".into(),
+            )),
         }
     }
 
