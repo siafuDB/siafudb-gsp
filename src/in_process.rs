@@ -78,7 +78,8 @@ impl InProcessReplicator {
 
         let mut applied = 0usize;
         while let Ok(entry) = rx.recv() {
-            destination.execute(&entry.query)?;
+            let p = entry.params.clone();
+            destination.execute_with_params(&entry.query, p)?;
             self.cursor = entry.sequence;
             applied += 1;
         }
