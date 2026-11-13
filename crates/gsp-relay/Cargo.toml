@@ -8,5 +8,20 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[[bin]]
+name = "gsp-relay"
+path = "src/main.rs"
+
 [dependencies]
+# Frame and sealed-item CBOR. The relay never opens a sealed item.
 gsp-wire = { path = "../gsp-wire", version = "0.1.0" }
+# Token hashing, record checksums, dedupe keys. `pure`: no C/asm build step.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+# Runtime, TCP listener, timers, signals. No TLS: it is terminated in front.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros"] }
+# HTTP/1.1 server only. Used directly: three routes do not need a router.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+# Tokio I/O adapter, timer, and graceful-shutdown helper for hyper.
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server-graceful"] }
+# `Full` response body and `BodyExt::frame` for size-capped reads.
+http-body-util = { version = "0.1", default-features = false }
