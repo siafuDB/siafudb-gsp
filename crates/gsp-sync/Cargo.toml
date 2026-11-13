@@ -12,3 +12,7 @@ homepage.workspace = true
 gsp-wire = { path = "../gsp-wire", version = "0.1.0" }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+blake3 = { version = "1", default-features = false, features = ["pure"] }

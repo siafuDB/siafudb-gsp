@@ -11,11 +11,11 @@ revocation and history compaction are not in v0 (see Limits).
 
 ## 1. Crates
 
-| Crate       | Role                                                                                   |
-| ----------- | -------------------------------------------------------------------------------------- |
-| `gsp-wire`  | Encoding, signatures, key log, sealing, frames. `no_std + alloc`.                      |
+| Crate       | Role                                                                                    |
+| ----------- | --------------------------------------------------------------------------------------- |
+| `gsp-wire`  | Encoding, signatures, key log, sealing, frames. `no_std + alloc`.                       |
 | `gsp-sync`  | The replica: pairing secrets, payload, merge, outbox, cursor. No I/O, no clock, no RNG. |
-| `gsp-relay` | Reference relay: an HTTP server that stores and forwards sealed items.                 |
+| `gsp-relay` | Reference relay: an HTTP server that stores and forwards sealed items.                  |
 
 `gsp-sync` knows nothing about any database engine. An engine adapter (for
 SiafuDB: in `siafuDB/siafudb`) turns local commits into `Change`s and applies
@@ -27,11 +27,11 @@ A fragment is created from a 32-byte random **root secret**. Showing it to a
 second device (QR code, typed code) is pairing. Everything else is derived
 with BLAKE3 `derive_key(context, root)`:
 
-| Value          | Context string             | Use                                             |
-| -------------- | -------------------------- | ----------------------------------------------- |
-| `fragment_key` | `gsp/v0/fragment-key`      | 32 bytes. Seals everything sent to the relay.   |
-| `fragment_id`  | `gsp/v0/fragment-id`       | First 16 bytes. Public routing id.              |
-| `relay_token`  | `gsp/v0/relay-token`       | 32 bytes. Bearer token for the relay (section 6). |
+| Value          | Context string        | Use                                               |
+| -------------- | --------------------- | ------------------------------------------------- |
+| `fragment_key` | `gsp/v0/fragment-key` | 32 bytes. Seals everything sent to the relay.     |
+| `fragment_id`  | `gsp/v0/fragment-id`  | First 16 bytes. Public routing id.                |
+| `relay_token`  | `gsp/v0/relay-token`  | 32 bytes. Bearer token for the relay (section 6). |
 
 The text form of the root secret is `gsp0-` followed by unpadded base64url of
 the 32 bytes.
@@ -53,11 +53,11 @@ Confidentiality does not depend on the signature algorithm.
 
 `Plain` (WIRE-V0 section 9) gains a third kind:
 
-| Kind | Content                 |
-| ---- | ----------------------- |
-| 1    | signed op               |
-| 2    | signed batch            |
-| 3    | signed key-log entry    |
+| Kind | Content              |
+| ---- | -------------------- |
+| 1    | signed op            |
+| 2    | signed batch         |
+| 3    | signed key-log entry |
 
 A device's first push is its genesis key-log entry (kind 3), then ops. An op
 whose author's key log is not known yet is held as pending, not dropped.
@@ -90,7 +90,7 @@ offline devices cannot collide.
 
 Every write carries the stamp `(hlc, op_id)` of its op. Stamps are ordered by
 HLC, then by the bytes of the op id. All rules below are functions of the
-*set* of ops applied, so replicas that have applied the same set hold the same
+_set_ of ops applied, so replicas that have applied the same set hold the same
 state regardless of arrival order.
 
 1. **Deletes win.** `node_del` / `edge_del` tombstone the gid for good. Any
@@ -114,8 +114,8 @@ every id in `deps` has been applied. Otherwise it is pending. Ops that are
 seq)` are an equivocation: the first seen stays, the second is rejected and the
 proof is kept.
 
-**Effects.** After applying ops, the replica emits the *difference in visible
-state* as a list of `Change`s for the engine adapter: only winning writes, a
+**Effects.** After applying ops, the replica emits the _difference in visible
+state_ as a list of `Change`s for the engine adapter: only winning writes, a
 `node_put` the first time a node becomes visible, `edge_del` for edges hidden
 by a node delete, and so on. Applying the same sealed item twice emits nothing
 the second time.
@@ -136,11 +136,11 @@ everything it receives.
 HTTP, CBOR bodies (`content-type: application/cbor`), frames from WIRE-V0
 section 10:
 
-| Request                              | Body            | Reply                     |
-| ------------------------------------ | --------------- | ------------------------- |
-| `POST /v0/push`                      | `Push`          | `Ack`                     |
-| `POST /v0/pull?wait_ms=<0..=25000>`  | `Pull`          | `Batch`                   |
-| `GET /healthz`                       |                 | `200 ok`                  |
+| Request                             | Body   | Reply    |
+| ----------------------------------- | ------ | -------- |
+| `POST /v0/push`                     | `Push` | `Ack`    |
+| `POST /v0/pull?wait_ms=<0..=25000>` | `Pull` | `Batch`  |
+| `GET /healthz`                      |        | `200 ok` |
 
 - `Authorization: Bearer <base64url relay_token>` on push and pull. The first
   push to a fragment id registers `BLAKE3(relay_token)`; after that the relay

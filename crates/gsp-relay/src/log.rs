@@ -39,7 +39,7 @@ pub(crate) fn emit(level: &str, event: &str, fields: std::fmt::Arguments<'_>) {
 macro_rules! info {
     ($event:expr, $($arg:tt)*) => { $crate::log::emit("info", $event, format_args!($($arg)*)) };
 }
-macro_rules! warn {
+macro_rules! warning {
     ($event:expr, $($arg:tt)*) => { $crate::log::emit("warn", $event, format_args!($($arg)*)) };
 }
-pub(crate) use {info, warn};
+pub(crate) use {info, warning};

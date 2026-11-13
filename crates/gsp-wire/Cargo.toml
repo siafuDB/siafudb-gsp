@@ -11,11 +11,24 @@ homepage.workspace = true
 [dependencies]
 # CBOR tokenizer/emitter. We hand-write every encoder on top of it so the
 # deterministic-encoding rules (RFC 8949 section 4.2) are ours, not serde's.
-minicbor = { version = "2", default-features = false, features = ["alloc", "half"] }
+minicbor = { version = "2", default-features = false, features = [
+  "alloc",
+  "half",
+] }
 half = { version = "2", default-features = false }
-ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "fast", "zeroize"] }
-ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "zeroize"] }
-chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "3", default-features = false, features = [
+  "alloc",
+  "fast",
+  "zeroize",
+] }
+ml-dsa = { version = "0.1", default-features = false, features = [
+  "alloc",
+  "zeroize",
+] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = [
+  "alloc",
+  "zeroize",
+] }
 # `pure`: the default build script compiles C/asm and breaks iOS/Android here.
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 sha3 = { version = "0.12", default-features = false }

@@ -1270,3 +1270,80 @@ fn hlc_bounded_drift() {
     );
     assert!(h.observe(remote, 120, 60).unwrap() > remote.max(h));
 }
+
+#[test]
+fn sealed_key_log_entry_is_kind_3() {
+    let a = author(FRAG, false, 1);
+    let genesis = a.log.entries()[0].clone();
+    let key = FragmentKey::new([0x11; 32]);
+    let sealed = SealedOp::seal(&key, FRAG, [0x24; 24], &Plain::KeyLog(genesis.clone())).unwrap();
+    let wire = sealed.to_bytes().unwrap();
+    let back = SealedOp::from_bytes(&wire).unwrap();
+    let Plain::KeyLog(inner) = back.open(&key, FRAG).unwrap() else {
+        panic!("kind")
+    };
+    assert_eq!(inner, genesis);
+    assert_eq!(KeyLog::genesis(&inner).unwrap(), a.log);
+
+    // The three kinds are distinct on the wire: same bytes, different kind,
+    // different plaintext, and one never opens as another.
+    let as_op = SealedOp::seal(&key, FRAG, [0x24; 24], &Plain::Op(genesis.clone())).unwrap();
+    assert_ne!(as_op.ciphertext, sealed.ciphertext);
+    assert_eq!(as_op.open(&key, FRAG).unwrap(), Plain::Op(genesis.clone()));
+
+    // The relay-visible bytes do not contain the public key or the author id.
+    let contains = |needle: &[u8]| wire.windows(needle.len()).any(|w| w == needle);
+    assert!(!contains(&a.ed.public().bytes));
+    assert!(!contains(&a.id().digest));
+
+    // Wrong key, wrong fragment, tampering.
+    assert_eq!(
+        back.open(&FragmentKey::new([0x12; 32]), FRAG),
+        Err(SealError::Decrypt)
+    );
+    assert_eq!(back.open(&key, FRAG_B), Err(SealError::WrongFragment));
+    let mut t = back.clone();
+    let last = t.ciphertext.len() - 1;
+    t.ciphertext[last] ^= 1;
+    assert_eq!(t.open(&key, FRAG), Err(SealError::Decrypt));
+}
+
+#[test]
+fn sealed_plaintext_kinds_outside_1_to_3_are_rejected() {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    let key_bytes = [0x11u8; 32];
+    let key = FragmentKey::new(key_bytes);
+    let aad = Value::Array(vec![
+        Value::Text("gsp/v0/sealed".into()),
+        Value::uint(0),
+        Value::uint(1),
+        Value::Bytes(FRAG.to_vec()),
+    ])
+    .encode()
+    .unwrap();
+    for kind in [0u64, 4, 255] {
+        let pt = Value::Array(vec![Value::uint(kind), Value::Bytes(vec![1, 2, 3])])
+            .encode()
+            .unwrap();
+        let cipher = chacha20poly1305::XChaCha20Poly1305::new((&key_bytes).into());
+        let ciphertext = cipher
+            .encrypt(
+                &chacha20poly1305::XNonce::from([9u8; 24]),
+                Payload {
+                    msg: &pt,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let sealed = SealedOp {
+            aead_alg: 1,
+            fragment_id: FRAG.to_vec(),
+            nonce: vec![9; 24],
+            ciphertext,
+        };
+        assert_eq!(
+            sealed.open(&key, FRAG),
+            Err(SealError::Malformed(DecodeError::UnsupportedKind(kind)))
+        );
+    }
+}
