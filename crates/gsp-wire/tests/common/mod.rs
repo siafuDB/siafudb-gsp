@@ -5,6 +5,11 @@ pub const FRAG: &[u8] = b"fragment-A";
 pub const FRAG_B: &[u8] = b"fragment-B";
 pub const H: u16 = 1; // BLAKE3-256
 
+/// Whether this build can make hybrid (Ed25519 + ML-DSA-65) authors. Tests
+/// that are not about hybrid signing as such use it to pick the strongest
+/// author the build has.
+pub const HYBRID: bool = cfg!(feature = "ml-dsa");
+
 pub struct Author {
     pub ed: SigningKey,
     pub pq: Option<SigningKey>,
@@ -23,8 +28,14 @@ impl Author {
 }
 
 pub fn author(fragment: &[u8], hybrid: bool, seed: u8) -> Author {
-    let ed = SigningKey::from_seed(SigAlg::Ed25519, &[seed; 32]);
-    let pq = hybrid.then(|| SigningKey::from_seed(SigAlg::MlDsa65, &[seed ^ 0xff; 32]));
+    let ed = SigningKey::ed25519(&[seed; 32]);
+    #[cfg(feature = "ml-dsa")]
+    let pq = hybrid.then(|| SigningKey::ml_dsa_65(&[seed ^ 0xff; 32]));
+    #[cfg(not(feature = "ml-dsa"))]
+    let pq: Option<SigningKey> = {
+        assert!(!hybrid, "hybrid authors need the ml-dsa feature");
+        None
+    };
     let mut keys = vec![ed.public()];
     let mut policy = vec![SigAlg::Ed25519.id()];
     let mut signers = vec![&ed];

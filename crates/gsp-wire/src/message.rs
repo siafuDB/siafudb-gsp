@@ -10,6 +10,12 @@ use crate::sealed::SealedOp;
 use crate::types::{Multihash, Signature};
 use alloc::{string::String, vec, vec::Vec};
 
+/// Most CBOR data items one frame may hold (arrays, strings and numbers all
+/// count). A `Batch` of 256 sealed ops has about 1 600; this leaves room for
+/// relays configured with much larger batches while keeping the memory a
+/// hostile frame can make a decoder allocate to a few MiB.
+pub const MAX_FRAME_ITEMS: usize = 65_536;
+
 /// A v0 frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -191,7 +197,8 @@ impl Message {
 
     /// Strict parse of one frame.
     pub fn from_bytes(bytes: &[u8]) -> Result<Message, DecodeError> {
-        let v = Value::decode(bytes)?;
+        // Frames arrive before anything is authenticated: bound the work.
+        let v = Value::decode_limited(bytes, MAX_FRAME_ITEMS)?;
         let mut f = Fields::open(&v, "message")?;
         let m = match f.u64()? {
             1 => Message::Hello {

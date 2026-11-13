@@ -114,7 +114,7 @@ pub(crate) fn eval_sigs<'a>(
             Resolved::Key(k) => k,
             Resolved::NotValid => return invalid(InvalidReason::KeyNotValidAtSeq),
             Resolved::Unknown => {
-                let why = if SigAlg::from_id(sig.alg).is_some() {
+                let why = if SigAlg::supported(sig.alg).is_some() {
                     UnverifiableReason::UnknownKey
                 } else {
                     UnverifiableReason::UnknownSigAlg

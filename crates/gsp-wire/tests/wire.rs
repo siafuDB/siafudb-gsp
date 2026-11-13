@@ -19,7 +19,7 @@ fn unverifiable<T: std::fmt::Debug>(v: Verdict<T>) -> UnverifiableReason {
 
 #[test]
 fn round_trip_op_ed25519_and_hybrid() {
-    for hybrid in [false, true] {
+    for hybrid in [false, HYBRID] {
         let a = author(FRAG, hybrid, 1);
         let op = Op::sign(&body(&a, FRAG, 3), &a.keys()).unwrap();
         assert_eq!(op.sigs().len(), if hybrid { 2 } else { 1 });
@@ -57,7 +57,7 @@ fn round_trip_op_ed25519_and_hybrid() {
 
 #[test]
 fn round_trip_sha3_ids() {
-    let ed = SigningKey::from_seed(SigAlg::Ed25519, &[9; 32]);
+    let ed = SigningKey::ed25519(&[9; 32]);
     let g = KeyLogEntry {
         hash_alg: HashAlg::Sha3_256.id(),
         prev: None,
@@ -153,10 +153,11 @@ fn round_trip_messages() {
     );
 }
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn round_trip_keylog_entries_and_rebuild() {
     let mut a = author(FRAG, true, 1);
-    let k2 = SigningKey::from_seed(SigAlg::Ed25519, &[42; 32]);
+    let k2 = SigningKey::ed25519(&[42; 32]);
     let add = KeyLogEntry {
         hash_alg: H,
         prev: Some(a.log.head().clone()),
@@ -258,6 +259,7 @@ fn determinism_1000_shuffled_map_orders() {
     );
 }
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn signature_order_is_normalised() {
     let a = author(FRAG, true, 1);
@@ -364,6 +366,7 @@ fn decoder_rejects_non_canonical() {
 
 // -------------------------------------------------------------------- tamper
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn tamper_every_field() {
     let a = author(FRAG, true, 1);
@@ -522,8 +525,8 @@ fn every_single_bit_flip_is_not_valid() {
 #[test]
 fn cross_fragment_replay_is_invalid() {
     // The same keys are used for an identity in fragment A and one in fragment B.
-    let a = author(FRAG, true, 1);
-    let b = author(FRAG_B, true, 1);
+    let a = author(FRAG, HYBRID, 1);
+    let b = author(FRAG_B, HYBRID, 1);
     assert_ne!(a.id(), b.id(), "author ids are fragment-bound");
     let logs = vec![a.log.clone(), b.log.clone()];
     let op = Op::sign(&body(&a, FRAG, 2), &a.keys()).unwrap();
@@ -564,6 +567,7 @@ fn cross_fragment_replay_is_invalid() {
 
 // ----------------------------------------------------------------- downgrade
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn stripping_a_hybrid_signature_is_a_downgrade() {
     let a = author(FRAG, true, 1);
@@ -591,7 +595,7 @@ fn stripping_a_hybrid_signature_is_a_downgrade() {
     );
     // Two Ed25519 signatures do not add up to a hybrid.
     let mut a2 = author(FRAG, true, 1);
-    let ed2 = SigningKey::from_seed(SigAlg::Ed25519, &[50; 32]);
+    let ed2 = SigningKey::ed25519(&[50; 32]);
     let add = KeyLogEntry {
         hash_alg: H,
         prev: Some(a2.log.head().clone()),
@@ -614,10 +618,11 @@ fn stripping_a_hybrid_signature_is_a_downgrade() {
     );
 }
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn policy_upgrade_takes_effect_at_seq() {
     let mut a = author(FRAG, false, 1);
-    let pq = SigningKey::from_seed(SigAlg::MlDsa65, &[77; 32]);
+    let pq = SigningKey::ml_dsa_65(&[77; 32]);
     let add = KeyLogEntry {
         hash_alg: H,
         prev: Some(a.log.head().clone()),
@@ -763,7 +768,7 @@ fn unknown_algorithms_are_unverifiable_never_valid() {
 
 #[test]
 fn equivocation_is_detected_and_provable() {
-    let a = author(FRAG, true, 1);
+    let a = author(FRAG, HYBRID, 1);
     let ctx = VerifyCtx::new(FRAG, &a.log);
     let mk = |seq: u64, prev: Option<Multihash>, text: &str| {
         let mut b = body(&a, FRAG, seq);
@@ -849,7 +854,7 @@ fn equivocation_is_detected_and_provable() {
 fn revoked_key_is_rejected_after_seq_n_and_accepted_before() {
     const N: u64 = 5;
     let mut a = author(FRAG, false, 1);
-    let k2 = SigningKey::from_seed(SigAlg::Ed25519, &[2; 32]);
+    let k2 = SigningKey::ed25519(&[2; 32]);
     let k1_id = a.ed.public().key_id(H).unwrap();
     let before = signed(&a, FRAG, N + 1);
     assert!(
@@ -927,7 +932,7 @@ fn revoked_key_is_rejected_after_seq_n_and_accepted_before() {
         InvalidReason::KeyNotValidAtSeq
     );
     // The revoked key can no longer extend the key log.
-    let k3 = SigningKey::from_seed(SigAlg::Ed25519, &[3; 32]);
+    let k3 = SigningKey::ed25519(&[3; 32]);
     let sneak = KeyLogEntry {
         hash_alg: H,
         prev: Some(a.log.head().clone()),
@@ -955,11 +960,12 @@ fn revoked_key_is_rejected_after_seq_n_and_accepted_before() {
     assert_eq!(a.log.find_key(&k1_id).unwrap().revoked_after, Some(N));
 }
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn keylog_rejects_bad_entries() {
     let a = author(FRAG, true, 1);
-    let stranger = SigningKey::from_seed(SigAlg::Ed25519, &[66; 32]);
-    let new = SigningKey::from_seed(SigAlg::Ed25519, &[67; 32]);
+    let stranger = SigningKey::ed25519(&[66; 32]);
+    let new = SigningKey::ed25519(&[67; 32]);
     let add = |prev: Multihash| KeyLogEntry {
         hash_alg: H,
         prev: Some(prev),
@@ -1105,6 +1111,7 @@ fn sealed_op_round_trip_tamper_and_wrong_key() {
 
 // --------------------------------------------------------------------- batch
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn batch_is_signed_as_a_unit() {
     let a = author(FRAG, true, 1);
@@ -1269,4 +1276,207 @@ fn hlc_bounded_drift() {
         "150 > 80 + 60: refuse to adopt"
     );
     assert!(h.observe(remote, 120, 60).unwrap() > remote.max(h));
+}
+
+#[test]
+fn sealed_key_log_entry_is_kind_3() {
+    let a = author(FRAG, false, 1);
+    let genesis = a.log.entries()[0].clone();
+    let key = FragmentKey::new([0x11; 32]);
+    let sealed = SealedOp::seal(&key, FRAG, [0x24; 24], &Plain::KeyLog(genesis.clone())).unwrap();
+    let wire = sealed.to_bytes().unwrap();
+    let back = SealedOp::from_bytes(&wire).unwrap();
+    let Plain::KeyLog(inner) = back.open(&key, FRAG).unwrap() else {
+        panic!("kind")
+    };
+    assert_eq!(inner, genesis);
+    assert_eq!(KeyLog::genesis(&inner).unwrap(), a.log);
+
+    // The three kinds are distinct on the wire: same bytes, different kind,
+    // different plaintext, and one never opens as another.
+    let as_op = SealedOp::seal(&key, FRAG, [0x24; 24], &Plain::Op(genesis.clone())).unwrap();
+    assert_ne!(as_op.ciphertext, sealed.ciphertext);
+    assert_eq!(as_op.open(&key, FRAG).unwrap(), Plain::Op(genesis.clone()));
+
+    // The relay-visible bytes do not contain the public key or the author id.
+    let contains = |needle: &[u8]| wire.windows(needle.len()).any(|w| w == needle);
+    assert!(!contains(&a.ed.public().bytes));
+    assert!(!contains(&a.id().digest));
+
+    // Wrong key, wrong fragment, tampering.
+    assert_eq!(
+        back.open(&FragmentKey::new([0x12; 32]), FRAG),
+        Err(SealError::Decrypt)
+    );
+    assert_eq!(back.open(&key, FRAG_B), Err(SealError::WrongFragment));
+    let mut t = back.clone();
+    let last = t.ciphertext.len() - 1;
+    t.ciphertext[last] ^= 1;
+    assert_eq!(t.open(&key, FRAG), Err(SealError::Decrypt));
+}
+
+#[test]
+fn sealed_plaintext_kinds_outside_1_to_3_are_rejected() {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    let key_bytes = [0x11u8; 32];
+    let key = FragmentKey::new(key_bytes);
+    let aad = Value::Array(vec![
+        Value::Text("gsp/v0/sealed".into()),
+        Value::uint(0),
+        Value::uint(1),
+        Value::Bytes(FRAG.to_vec()),
+    ])
+    .encode()
+    .unwrap();
+    for kind in [0u64, 4, 255] {
+        let pt = Value::Array(vec![Value::uint(kind), Value::Bytes(vec![1, 2, 3])])
+            .encode()
+            .unwrap();
+        let cipher = chacha20poly1305::XChaCha20Poly1305::new((&key_bytes).into());
+        let ciphertext = cipher
+            .encrypt(
+                &chacha20poly1305::XNonce::from([9u8; 24]),
+                Payload {
+                    msg: &pt,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        let sealed = SealedOp {
+            aead_alg: 1,
+            fragment_id: FRAG.to_vec(),
+            nonce: vec![9; 24],
+            ciphertext,
+        };
+        assert_eq!(
+            sealed.open(&key, FRAG),
+            Err(SealError::Malformed(DecodeError::UnsupportedKind(kind)))
+        );
+    }
+}
+
+// ------------------------------------------------- decoder cost on hostile input
+
+/// CBOR head for `major` with a 32-bit length.
+fn head32(major: u8, n: u32) -> Vec<u8> {
+    let mut v = vec![(major << 5) | 26];
+    v.extend_from_slice(&n.to_be_bytes());
+    v
+}
+
+#[test]
+fn map_key_order_is_enforced_at_the_first_offending_key() {
+    // 1 MiB that claims to be one big map. The first two keys are equal;
+    // everything after them is not even CBOR. A decoder that builds the map
+    // before checking keys would report `Cbor` (or run out of memory on a
+    // well-formed tail); one that checks as it goes reports the key.
+    const N: u32 = 300_000;
+    let mut dup = head32(5, N);
+    dup.extend_from_slice(&[0x61, b'a', 0x00, 0x61, b'a', 0x00]);
+    dup.resize(1 << 20, 0xff);
+    assert_eq!(Value::decode(&dup), Err(DecodeError::DuplicateKey));
+
+    let mut unsorted = head32(5, N);
+    unsorted.extend_from_slice(&[0x61, b'b', 0x00, 0x61, b'a', 0x00]);
+    unsorted.resize(1 << 20, 0xff);
+    assert_eq!(Value::decode(&unsorted), Err(DecodeError::NonCanonical));
+
+    // Length-first order: "b" sorts before "aa".
+    let mut by_len = head32(5, N);
+    by_len.extend_from_slice(&[0x62, b'a', b'a', 0x00, 0x61, b'b', 0x00]);
+    by_len.resize(1 << 20, 0xff);
+    assert_eq!(Value::decode(&by_len), Err(DecodeError::NonCanonical));
+
+    // The same inside a frame, nested, and a well-formed megabyte of
+    // duplicate keys: all fail on the second key, in no time.
+    let mut all_dup = head32(5, 349_524);
+    while all_dup.len() + 3 <= 1 << 20 {
+        all_dup.extend_from_slice(&[0x61, b'k', 0x00]);
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        assert_eq!(Value::decode(&all_dup), Err(DecodeError::DuplicateKey));
+        assert!(Message::from_bytes(&all_dup).is_err());
+    }
+    // 400 megabyte-sized hostile inputs. Building each map first costs
+    // seconds and tens of MiB apiece; failing at the second key costs
+    // microseconds. The bound is loose enough for any machine.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+    // Sorted keys still decode, and shortest-first order is the accepted one.
+    let ok = Value::Map(vec![
+        ("b".into(), Value::uint(1)),
+        ("aa".into(), Value::uint(2)),
+        ("a".into(), Value::uint(3)),
+    ])
+    .encode()
+    .unwrap();
+    assert!(Value::decode(&ok).is_ok());
+}
+
+#[test]
+fn item_limit_stops_a_frame_of_tiny_items_early() {
+    // 1 MiB array of one-byte integers: valid CBOR, and as a `Value` about
+    // thirty times its size. A frame may hold at most MAX_FRAME_ITEMS items,
+    // so the decoder refuses on reading the array head, before allocating.
+    let n = (1u32 << 20) - 5;
+    let mut big = head32(4, n);
+    big.resize(1 << 20, 0x00);
+    assert_eq!(
+        Value::decode_limited(&big, gsp_wire::message::MAX_FRAME_ITEMS),
+        Err(DecodeError::Shape("too many items"))
+    );
+    assert_eq!(
+        Message::from_bytes(&big),
+        Err(DecodeError::Shape("too many items"))
+    );
+    // Nested arrays that each stay under the limit but add up beyond it:
+    // refused when the budget runs out, and the garbage after that point is
+    // never looked at.
+    let mut nested = vec![0x82];
+    for _ in 0..2 {
+        nested.extend(head32(4, 40_000));
+        nested.resize(nested.len() + 40_000, 0x00);
+    }
+    let cut = nested.len() - 10_000;
+    nested.truncate(cut);
+    nested.resize(1 << 20, 0xff);
+    assert_eq!(
+        Value::decode_limited(&nested, gsp_wire::message::MAX_FRAME_ITEMS),
+        Err(DecodeError::Shape("too many items"))
+    );
+    // An array that claims more elements than there are bytes left is
+    // refused before anything is reserved for it.
+    let mut liar = head32(4, u32::MAX);
+    liar.extend_from_slice(&[0; 16]);
+    assert_eq!(Value::decode(&liar), Err(DecodeError::Cbor));
+    let mut liar = vec![0x9b];
+    liar.extend_from_slice(&u64::MAX.to_be_bytes());
+    assert_eq!(Value::decode(&liar), Err(DecodeError::Cbor));
+    let mut liar = vec![0xbb];
+    liar.extend_from_slice(&u64::MAX.to_be_bytes());
+    assert_eq!(Value::decode(&liar), Err(DecodeError::Cbor));
+
+    // The limit counts every item and is exact.
+    let v = Value::Array(vec![Value::uint(1), Value::Array(vec![Value::Null])]);
+    let enc = v.encode().unwrap();
+    assert_eq!(Value::decode_limited(&enc, 4), Ok(v));
+    assert_eq!(
+        Value::decode_limited(&enc, 3),
+        Err(DecodeError::Shape("too many items"))
+    );
+    // Real frames are far below it: a full default batch.
+    let sealed = SealedOp {
+        aead_alg: 1,
+        fragment_id: FRAG.to_vec(),
+        nonce: vec![0; 24],
+        ciphertext: vec![0; 64],
+    };
+    let batch = Message::Batch {
+        fragment_id: FRAG.to_vec(),
+        next: 256,
+        more: false,
+        sealed: vec![sealed; 256],
+    };
+    assert_eq!(Message::from_bytes(&batch.to_bytes().unwrap()), Ok(batch));
 }

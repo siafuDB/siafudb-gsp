@@ -248,7 +248,7 @@ impl KeyLog {
         else {
             return Err(KeyLogError::Genesis);
         };
-        if policy.iter().any(|a| SigAlg::from_id(*a).is_none()) {
+        if policy.iter().any(|a| SigAlg::supported(*a).is_none()) {
             return Err(KeyLogError::Unsupported);
         }
         let mut states = Vec::new();
@@ -322,7 +322,7 @@ impl KeyLog {
                 st.revoked_after = Some(st.revoked_after.map_or(after_seq, |n| n.min(after_seq)));
             }
             KeyLogAction::SetPolicy { policy, from_seq } => {
-                if policy.iter().any(|a| SigAlg::from_id(*a).is_none()) {
+                if policy.iter().any(|a| SigAlg::supported(*a).is_none()) {
                     return Err(KeyLogError::Unsupported);
                 }
                 next.policies.push((from_seq, policy));

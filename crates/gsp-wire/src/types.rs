@@ -4,6 +4,7 @@
 use crate::cbor::{DecodeError, EncodeError, Fields, Value};
 use crate::registry::{HashAlg, SigAlg};
 use alloc::{boxed::Box, vec, vec::Vec};
+#[cfg(feature = "ml-dsa")]
 use ml_dsa::MlDsa65;
 
 /// Wire structure version implemented by this crate.
@@ -127,7 +128,7 @@ pub(crate) enum RawCheck {
 }
 
 pub(crate) fn verify_raw(key: &PublicKey, msg: &[u8], sig: &[u8]) -> RawCheck {
-    let Some(alg) = SigAlg::from_id(key.alg) else {
+    let Some(alg) = SigAlg::supported(key.alg) else {
         return RawCheck::UnknownAlg;
     };
     let good = match alg {
@@ -141,6 +142,9 @@ pub(crate) fn verify_raw(key: &PublicKey, msg: &[u8], sig: &[u8]) -> RawCheck {
             vk.verify_strict(msg, &sg).ok()
         })()
         .is_some(),
+        #[cfg(not(feature = "ml-dsa"))]
+        SigAlg::MlDsa65 => return RawCheck::UnknownAlg,
+        #[cfg(feature = "ml-dsa")]
         SigAlg::MlDsa65 => (|| {
             let pk = ml_dsa::EncodedVerifyingKey::<MlDsa65>::try_from(key.bytes.as_slice()).ok()?;
             let sg = ml_dsa::EncodedSignature::<MlDsa65>::try_from(sig).ok()?;
@@ -159,7 +163,9 @@ pub(crate) fn verify_raw(key: &PublicKey, msg: &[u8], sig: &[u8]) -> RawCheck {
 pub enum SigningKey {
     /// Ed25519.
     Ed25519(Box<ed25519_dalek::SigningKey>),
-    /// ML-DSA-65 (seed form, FIPS 204 `ML-DSA.KeyGen_internal(xi)`).
+    /// ML-DSA-65 (seed form, FIPS 204 `ML-DSA.KeyGen_internal(xi)`). Only
+    /// with the `ml-dsa` cargo feature.
+    #[cfg(feature = "ml-dsa")]
     MlDsa65(Box<ml_dsa::SigningKey<MlDsa65>>),
 }
 
@@ -170,16 +176,28 @@ impl core::fmt::Debug for SigningKey {
 }
 
 impl SigningKey {
-    /// Derive a key pair from a 32-byte secret seed.
+    /// An Ed25519 key pair from a 32-byte secret seed.
+    pub fn ed25519(seed: &[u8; 32]) -> SigningKey {
+        SigningKey::Ed25519(Box::new(ed25519_dalek::SigningKey::from_bytes(seed)))
+    }
+
+    /// An ML-DSA-65 key pair from a 32-byte secret seed. Only with the
+    /// `ml-dsa` cargo feature.
+    #[cfg(feature = "ml-dsa")]
+    pub fn ml_dsa_65(seed: &[u8; 32]) -> SigningKey {
+        let seed = ml_dsa::Seed::from(*seed);
+        SigningKey::MlDsa65(Box::new(ml_dsa::SigningKey::<MlDsa65>::from_seed(&seed)))
+    }
+
+    /// Derive a key pair for any registered algorithm from a 32-byte secret
+    /// seed. Exists only in builds that implement every registered signature
+    /// algorithm (that is, with the `ml-dsa` cargo feature); code that must
+    /// build either way uses [`SigningKey::ed25519`].
+    #[cfg(feature = "ml-dsa")]
     pub fn from_seed(alg: SigAlg, seed: &[u8; 32]) -> SigningKey {
         match alg {
-            SigAlg::Ed25519 => {
-                SigningKey::Ed25519(Box::new(ed25519_dalek::SigningKey::from_bytes(seed)))
-            }
-            SigAlg::MlDsa65 => {
-                let seed = ml_dsa::Seed::from(*seed);
-                SigningKey::MlDsa65(Box::new(ml_dsa::SigningKey::<MlDsa65>::from_seed(&seed)))
-            }
+            SigAlg::Ed25519 => SigningKey::ed25519(seed),
+            SigAlg::MlDsa65 => SigningKey::ml_dsa_65(seed),
         }
     }
 
@@ -187,6 +205,7 @@ impl SigningKey {
     pub fn alg(&self) -> SigAlg {
         match self {
             SigningKey::Ed25519(_) => SigAlg::Ed25519,
+            #[cfg(feature = "ml-dsa")]
             SigningKey::MlDsa65(_) => SigAlg::MlDsa65,
         }
     }
@@ -198,6 +217,7 @@ impl SigningKey {
                 alg: SigAlg::Ed25519.id(),
                 bytes: k.verifying_key().to_bytes().to_vec(),
             },
+            #[cfg(feature = "ml-dsa")]
             SigningKey::MlDsa65(k) => {
                 use ml_dsa::signature::Keypair;
                 PublicKey {
@@ -215,6 +235,7 @@ impl SigningKey {
                 use ed25519_dalek::Signer;
                 k.sign(msg).to_bytes().to_vec()
             }
+            #[cfg(feature = "ml-dsa")]
             SigningKey::MlDsa65(k) => k
                 .expanded_key()
                 .sign_deterministic(msg, &[])
@@ -365,7 +386,8 @@ impl Signed {
 
     /// Strict parse. Does **not** verify anything.
     pub fn from_bytes(bytes: &[u8]) -> Result<Signed, DecodeError> {
-        let v = Value::decode(bytes)?;
+        // body, sigs, and at most 16 signatures of 6 items each.
+        let v = Value::decode_limited(bytes, 128)?;
         let mut f = Fields::exact(&v, 2, "signed envelope")?;
         let body = f.bytes()?.to_vec();
         let raw = f.array()?;

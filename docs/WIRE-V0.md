@@ -21,16 +21,16 @@ Everything is CBOR (RFC 8949) in the **core deterministic encoding** of section
 
 Allowed data items:
 
-| Item          | Notes                                                                 |
-| ------------- | --------------------------------------------------------------------- |
-| unsigned int  | major type 0, `0 ..= 2^64-1`                                          |
-| negative int  | major type 1, `-2^64 ..= -1`                                          |
-| byte string   | definite length                                                       |
-| text string   | definite length, valid UTF-8                                          |
-| array         | definite length                                                       |
-| map           | definite length, **text-string keys only**                            |
-| `false`, `true`, `null` | `f4`, `f5`, `f6`                                            |
-| float         | `f9` / `fa` / `fb`                                                    |
+| Item                    | Notes                                      |
+| ----------------------- | ------------------------------------------ |
+| unsigned int            | major type 0, `0 ..= 2^64-1`               |
+| negative int            | major type 1, `-2^64 ..= -1`               |
+| byte string             | definite length                            |
+| text string             | definite length, valid UTF-8               |
+| array                   | definite length                            |
+| map                     | definite length, **text-string keys only** |
+| `false`, `true`, `null` | `f4`, `f5`, `f6`                           |
+| float                   | `f9` / `fa` / `fb`                         |
 
 Not allowed anywhere: tags, indefinite lengths, `undefined`, other simple
 values, non-text map keys, bignums. Maximum nesting depth is 32.
@@ -52,6 +52,21 @@ with the rules above, and rejects the input unless the re-encoding is
 byte-identical. This is how the Rust implementation does it; it makes
 "canonical" a property that is checked rather than assumed.
 
+**Decoder cost.** Frames are decoded before anything is authenticated, so a
+decoder MUST NOT let the input decide how much it allocates:
+
+- a claimed array or map length larger than the number of input bytes left is
+  an error, checked before anything is reserved for it;
+- map keys are checked **while decoding**: each key's encoding MUST be
+  strictly greater, bytewise, than the previous one, and the decoder fails at
+  the first key that is not (equal: duplicate key; smaller: not canonical). A
+  megabyte of repeated keys fails at its second key;
+- a decoder bounds the total number of data items (arrays, maps, map values
+  and scalars each count as one) by what the structure being read can hold. An
+  in-memory item is many times larger than a one-byte item on the wire. The
+  Rust implementation allows 65 536 items per frame (section 10), 128 for a
+  `Signed` envelope, 8 for a `SealedOp` header and 4 for a `Plain`.
+
 **TypeScript notes.** Integers above `2^53` occur (`u64` clocks and sequence
 numbers fit, but the type allows the full range): decode integers as `bigint`
 or reject values you cannot represent, never round. JavaScript has one number
@@ -68,17 +83,39 @@ All structures are **arrays with positional fields**; maps appear only inside
 Numeric, append-only, `0` invalid. Ids are carried as `uint` and MUST survive
 a round trip even when unknown.
 
-| Registry | Id | Name               | In this implementation                 |
-| -------- | -- | ------------------ | -------------------------------------- |
-| SigAlg   | 1  | Ed25519            | yes (strict verification, see 5.3)     |
-| SigAlg   | 2  | ML-DSA-65          | yes (FIPS 204, empty context)          |
-| HashAlg  | 1  | BLAKE3-256         | yes, default                           |
-| HashAlg  | 2  | SHA3-256           | yes                                    |
-| HashAlg  | 3  | SHA-256            | registered only: treated as unknown    |
-| KemAlg   | 1  | X25519             | registered only                        |
-| KemAlg   | 2  | ML-KEM-768         | registered only                        |
-| AeadAlg  | 1  | XChaCha20-Poly1305 | yes                                    |
-| AeadAlg  | 2  | AES-256-GCM        | registered only                        |
+| Registry | Id  | Name               | In this implementation                  |
+| -------- | --- | ------------------ | --------------------------------------- |
+| SigAlg   | 1   | Ed25519            | yes (strict verification, see 5.3)      |
+| SigAlg   | 2   | ML-DSA-65          | yes (FIPS 204), unless built without it |
+| HashAlg  | 1   | BLAKE3-256         | yes, default                            |
+| HashAlg  | 2   | SHA3-256           | yes                                     |
+| HashAlg  | 3   | SHA-256            | registered only: treated as unknown     |
+| KemAlg   | 1   | X25519             | registered only                         |
+| KemAlg   | 2   | ML-KEM-768         | registered only                         |
+| AeadAlg  | 1   | XChaCha20-Poly1305 | yes                                     |
+| AeadAlg  | 2   | AES-256-GCM        | registered only                         |
+
+**An implementation may omit an algorithm.** The table says what the Rust
+crate implements with its default features; built without its `ml-dsa`
+feature it does not implement ML-DSA-65, and a TypeScript port may start with
+Ed25519 alone. A registered algorithm that an implementation does not have is
+handled exactly like an id it has never heard of:
+
+- parsing is unaffected: keys, signatures and policies carrying the id are
+  read, kept and re-encoded unchanged, and content ids do not depend on it;
+- a signature of that algorithm cannot be checked, so the op is `Unverifiable`
+  (`UnknownSigAlg`), never `Valid`, and never `Invalid` on that ground
+  (section 6). A bad signature of an algorithm the implementation does have
+  still makes the op `Invalid`;
+- a key-log entry that needs the algorithm (a genesis or `SetPolicy` whose
+  policy lists it, or an entry signed with it) is not applied (section 5,
+  rule 5): the log stays where it was, and for a genesis there is no log;
+- the object is kept and evaluated again by software that has the algorithm.
+  It is not dropped as invalid and not counted against its author.
+
+So an Ed25519-only implementation can take full part in a fragment whose
+authors all have the policy `[1]`, and cannot verify, and so does not apply,
+the ops of a hybrid author.
 
 `format` is the structure version. This document defines `format = 0`. A
 structure with another `format` is `Unverifiable` (section 6), not invalid.
@@ -125,11 +162,11 @@ not transmitted.
 sig_input = CBOR([domain: tstr, audience: bstr, id: Multihash, alg: uint, key_id: Multihash])
 ```
 
-| Signed thing  | `domain`          | `audience`               |
-| ------------- | ----------------- | ------------------------ |
-| op            | `"gsp/v0/op"`     | the op's `fragment_id`   |
-| key-log entry | `"gsp/v0/keylog"` | empty byte string        |
-| batch         | `"gsp/v0/batch"`  | the batch's `fragment_id`|
+| Signed thing  | `domain`          | `audience`                |
+| ------------- | ----------------- | ------------------------- |
+| op            | `"gsp/v0/op"`     | the op's `fragment_id`    |
+| key-log entry | `"gsp/v0/keylog"` | empty byte string         |
+| batch         | `"gsp/v0/batch"`  | the batch's `fragment_id` |
 
 `alg` and `key_id` are those of the `Signature` entry being produced. The
 signature is the raw algorithm output over the `sig_input` bytes (Ed25519:
@@ -275,17 +312,17 @@ Steps, in order; the first that fires decides:
 6. Signature set, with `required = policy at seq`:
    1. `sigs` empty: Invalid `NoSignatures`.
    2. For each signature, look `key_id` up in the author's log.
-      - Not found: remember it as *open* (`UnknownKey`, or `UnknownSigAlg` if
+      - Not found: remember it as _open_ (`UnknownKey`, or `UnknownSigAlg` if
         the algorithm id is unknown) and continue.
       - Found but not valid at `seq`: Invalid `KeyNotValidAtSeq`.
       - Found, `key.alg != sig.alg`: Invalid `AlgMismatch`.
-      - Found, algorithm unknown to the implementation: *open*
+      - Found, algorithm unknown to the implementation: _open_
         (`UnknownSigAlg`).
       - Otherwise verify over `sig_input`. Failure: Invalid `BadSignature`.
    3. For each algorithm in `required`: if no signature of that algorithm
-      verified and no *open* signature claims that algorithm, Invalid
+      verified and no _open_ signature claims that algorithm, Invalid
       `MissingRequiredSignature`.
-   4. If any signature is *open*: Unverifiable with the first open reason.
+   4. If any signature is _open_: Unverifiable with the first open reason.
 7. Clock supplied and `hlc.wall_ms > now + max_drift`: Unverifiable
    `HlcTooFarAhead`.
 8. Valid.
@@ -350,7 +387,8 @@ unit. It does not replace the ops' own signatures.
 Sign, then encrypt.
 
 ```text
-Plain    = [kind: uint, bytes: bstr]       ; 1 = Signed op, 2 = Signed batch
+Plain    = [kind: uint, bytes: bstr]       ; 1 = Signed op, 2 = Signed batch,
+                                           ; 3 = Signed key-log entry (SignedEntry)
 SealedOp = [format: uint, aead_alg: uint, fragment_id: bstr, nonce: bstr, ciphertext: bstr]
 aad      = CBOR(["gsp/v0/sealed", format, aead_alg, fragment_id])
 ```
@@ -361,8 +399,13 @@ libsodium / RFC 8439 layout). `key` is the 32-byte fragment key.
 
 - The nonce MUST be unique per key. Use 24 bytes from a CSPRNG.
 - The receiver MUST check that `fragment_id` is the fragment it expects, then
-  decrypt, then run section 6 or 8 on the result. Decrypting proves only that
-  the sender held the fragment key.
+  decrypt, then run section 6 (kind 1), section 8 (kind 2) or the key-log
+  acceptance rules of section 5 (kind 3) on the result. Decrypting proves only
+  that the sender held the fragment key. Any other `kind` is a decode error.
+- Kind 3 carries one `SignedEntry` so that key logs travel through a relay
+  under the same encryption as ops. A genesis entry names its fragment inside
+  the signed body; the receiver MUST check that it equals the `fragment_id` of
+  the sealed header it arrived in.
 - A relay learns: fragment id, nonce, ciphertext length, timing. It does not
   learn author, `seq`, clocks, key ids, signatures or payload. There is no
   length padding in v0.

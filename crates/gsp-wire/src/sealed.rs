@@ -26,13 +26,17 @@ impl FragmentKey {
 }
 
 /// What is inside a sealed op. CBOR: `[kind: uint, bytes: bstr]`,
-/// kind 1 = signed op, kind 2 = signed batch.
+/// kind 1 = signed op, kind 2 = signed batch, kind 3 = signed key-log entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plain {
     /// A signed op (wire bytes) for [`verify`](crate::verify).
     Op(Vec<u8>),
     /// A signed batch (wire bytes) for [`verify_batch`](crate::verify_batch).
     Batch(Vec<u8>),
+    /// A signed key-log entry (wire bytes) for
+    /// [`KeyLog::genesis`](crate::KeyLog::genesis) /
+    /// [`KeyLog::append`](crate::KeyLog::append).
+    KeyLog(Vec<u8>),
 }
 
 /// Why sealing or opening failed.
@@ -98,6 +102,7 @@ impl SealedOp {
         let (kind, bytes) = match plain {
             Plain::Op(b) => (1, b),
             Plain::Batch(b) => (2, b),
+            Plain::KeyLog(b) => (3, b),
         };
         let pt = Zeroizing::new(
             Value::Array(vec![Value::uint(kind), Value::Bytes(bytes.clone())])
@@ -151,13 +156,14 @@ impl SealedOp {
                 )
                 .map_err(|_| SealError::Decrypt)?,
         );
-        let v = Value::decode(&pt).map_err(SealError::Malformed)?;
+        let v = Value::decode_limited(&pt, 4).map_err(SealError::Malformed)?;
         let mut f = Fields::exact(&v, 2, "sealed plaintext").map_err(SealError::Malformed)?;
         let kind = f.u64().map_err(SealError::Malformed)?;
         let bytes = f.bytes().map_err(SealError::Malformed)?.to_vec();
         match kind {
             1 => Ok(Plain::Op(bytes)),
             2 => Ok(Plain::Batch(bytes)),
+            3 => Ok(Plain::KeyLog(bytes)),
             k => Err(SealError::Malformed(DecodeError::UnsupportedKind(k))),
         }
     }
@@ -203,6 +209,6 @@ impl SealedOp {
 
     /// Strict parse (no decryption).
     pub fn from_bytes(bytes: &[u8]) -> Result<SealedOp, DecodeError> {
-        SealedOp::from_value(&Value::decode(bytes)?)
+        SealedOp::from_value(&Value::decode_limited(bytes, 8)?)
     }
 }
