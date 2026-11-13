@@ -98,16 +98,16 @@ fn hybrid_objects_parse_in_every_build() {
 
 #[test]
 fn a_key_log_that_needs_an_unimplemented_algorithm_is_unsupported() {
-    match KeyLog::genesis(HYBRID_GENESIS) {
-        Ok(log) => {
-            assert!(ML_DSA, "accepted without being able to check it");
-            assert!(verify(HYBRID_OP, &VerifyCtx::new(FRAG, &log)).is_valid());
-        }
+    let res = KeyLog::genesis(HYBRID_GENESIS);
+    assert_eq!(
+        res.is_ok(),
+        ML_DSA,
+        "accepted only by a build that can check it"
+    );
+    match res {
+        Ok(log) => assert!(verify(HYBRID_OP, &VerifyCtx::new(FRAG, &log)).is_valid()),
         // Not `Unauthorized`, not `Malformed`: this build cannot tell.
-        Err(e) => {
-            assert!(!ML_DSA);
-            assert_eq!(e, KeyLogError::Unsupported);
-        }
+        Err(e) => assert_eq!(e, KeyLogError::Unsupported),
     }
     // Without the key log the op's author is simply unknown.
     let (_, ed_log) = ed_author();

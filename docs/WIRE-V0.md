@@ -83,17 +83,17 @@ All structures are **arrays with positional fields**; maps appear only inside
 Numeric, append-only, `0` invalid. Ids are carried as `uint` and MUST survive
 a round trip even when unknown.
 
-| Registry | Id  | Name               | In this implementation              |
-| -------- | --- | ------------------ | ----------------------------------- |
-| SigAlg   | 1   | Ed25519            | yes (strict verification, see 5.3)  |
-| SigAlg   | 2   | ML-DSA-65          | yes (FIPS 204, empty context)       |
-| HashAlg  | 1   | BLAKE3-256         | yes, default                        |
-| HashAlg  | 2   | SHA3-256           | yes                                 |
-| HashAlg  | 3   | SHA-256            | registered only: treated as unknown |
-| KemAlg   | 1   | X25519             | registered only                     |
-| KemAlg   | 2   | ML-KEM-768         | registered only                     |
-| AeadAlg  | 1   | XChaCha20-Poly1305 | yes                                 |
-| AeadAlg  | 2   | AES-256-GCM        | registered only                     |
+| Registry | Id  | Name               | In this implementation                  |
+| -------- | --- | ------------------ | --------------------------------------- |
+| SigAlg   | 1   | Ed25519            | yes (strict verification, see 5.3)      |
+| SigAlg   | 2   | ML-DSA-65          | yes (FIPS 204), unless built without it |
+| HashAlg  | 1   | BLAKE3-256         | yes, default                            |
+| HashAlg  | 2   | SHA3-256           | yes                                     |
+| HashAlg  | 3   | SHA-256            | registered only: treated as unknown     |
+| KemAlg   | 1   | X25519             | registered only                         |
+| KemAlg   | 2   | ML-KEM-768         | registered only                         |
+| AeadAlg  | 1   | XChaCha20-Poly1305 | yes                                     |
+| AeadAlg  | 2   | AES-256-GCM        | registered only                         |
 
 **An implementation may omit an algorithm.** The table says what the Rust
 crate implements with its default features; built without its `ml-dsa`
