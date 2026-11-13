@@ -60,6 +60,8 @@ fn post(addr: &str, path: &str, token: &[u8; 32], frame: &Message) -> Res<(u16, 
 }
 
 fn main() -> Res<()> {
+    // The relay address is an ordinary argument, not a security decision.
+    // nosemgrep: rust.lang.security.args.args
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:8787".into());

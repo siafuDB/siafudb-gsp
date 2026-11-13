@@ -49,6 +49,9 @@ async fn run(o: Options) -> std::io::Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Command-line flags only; the program name (argv[0]) is skipped and
+    // nothing here is a security decision.
+    // nosemgrep: rust.lang.security.args.args
     let options = match parse(std::env::args().skip(1), |k| std::env::var(k).ok()) {
         Ok(Cli::Run(o)) => *o,
         Ok(Cli::Help) => {
