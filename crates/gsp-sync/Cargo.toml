@@ -1,0 +1,14 @@
+[package]
+name = "gsp-sync"
+description = "Graph Sync Protocol v0 replica: pairing, payload, merge, outbox. No I/O; engine-independent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+gsp-wire = { path = "../gsp-wire", version = "0.1.0" }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }

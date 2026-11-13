@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/siafudb-sync", "crates/gsp-wire"]
+members = ["crates/gsp-wire", "crates/gsp-sync", "crates/gsp-relay"]
 
-# GSP: the SiafuDB Graph Sync Protocol, extracted from siafuDB/siafudb.
-# Engine-independent protocol pieces will move into their own crate
-# (gsp-wire); siafudb-sync is the engine-facing adapter layer.
+# GSP: the SiafuDB Graph Sync Protocol. Engine-independent: the SiafuDB
+# adapter lives in siafuDB/siafudb.
 
 [workspace.package]
 version = "0.1.0"
@@ -14,17 +13,8 @@ license = "Apache-2.0"
 repository = "https://github.com/siafuDB/siafudb-gsp"
 homepage = "https://siafudb.org"
 
-[workspace.dependencies]
-# Until siafudb-core is on crates.io, track the repo. Switch to
-# `version = "0.1"` after the first publish.
-siafudb-core = { git = "https://github.com/siafuDB/siafudb", branch = "claude/siafudb-feasibility-spike-dhgusd" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde", "js"] }
-thiserror = "2"
-tracing = "0.1"
-tokio = { version = "1", features = ["full"] }
-crossbeam = "0.8"
-sha2 = "0.11"
-hex = "0.4"
-async-trait = "0.1"
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

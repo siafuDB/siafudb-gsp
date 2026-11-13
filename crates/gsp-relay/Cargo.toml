@@ -1,0 +1,12 @@
+[package]
+name = "gsp-relay"
+description = "Graph Sync Protocol v0 reference relay: stores and forwards sealed items it cannot read."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+gsp-wire = { path = "../gsp-wire", version = "0.1.0" }
