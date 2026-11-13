@@ -87,30 +87,23 @@ pub(crate) fn bytes(b: &[u8]) -> Value {
     Value::Bytes(b.to_vec())
 }
 
-/// Structural equality that treats floats by bit pattern after NaN
-/// normalisation, so `NaN == NaN` and `0.0 != -0.0`: exactly the equality of
-/// the deterministic encodings. Maps are compared as sets of entries.
+/// Equality of the deterministic encodings: `NaN == NaN`, `0.0 != -0.0`,
+/// and the in-memory order of map entries does not matter. Linear in the
+/// size of the values (plus the sort of map keys the encoder does).
 pub(crate) fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        // The common cases need no encoding.
         (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => {
-            (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
-        }
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
-        (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| value_eq(p, q))
-        }
-        (Value::Map(x), Value::Map(y)) => {
-            x.len() == y.len()
-                && x.iter().all(|(k, p)| {
-                    y.iter()
-                        .find(|(k2, _)| k2 == k)
-                        .is_some_and(|(_, q)| value_eq(p, q))
-                })
-        }
+        (Value::Float(_), Value::Float(_))
+        | (Value::Array(_), Value::Array(_))
+        | (Value::Map(_), Value::Map(_)) => match (a.encode(), b.encode()) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        },
         _ => false,
     }
 }

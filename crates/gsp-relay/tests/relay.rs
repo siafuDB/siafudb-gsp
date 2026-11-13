@@ -169,58 +169,6 @@ async fn long_poll_wakes_on_push() {
 }
 
 #[tokio::test]
-async fn long_poll_on_a_fragment_nobody_pushed_to_yet_wakes_on_first_push() {
-    let relay = mem_relay(Config::default());
-    let f = Fragment::new(6);
-    let waiter = {
-        let relay = relay.clone();
-        let req = post(
-            "/v0/pull?wait_ms=20000",
-            Some(&f.bearer()),
-            f.pull_bytes(0, 10),
-        );
-        tokio::spawn(async move { call(&relay, req).await })
-    };
-    while relay.poll_count() == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    // Waiting did not register the fragment.
-    assert_eq!(relay.fragment_count(), 0);
-    let item = f.seal_n(1, 10);
-    push(&relay, &f, item.clone()).await;
-    let reply = tokio::time::timeout(Duration::from_secs(5), waiter)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(batch(reply.message(), &f), (1, false, item));
-}
-
-#[tokio::test]
-async fn long_poll_with_the_wrong_token_gets_401_once_the_fragment_is_registered() {
-    let relay = mem_relay(Config::default());
-    let f = Fragment::new(7);
-    let stranger = Fragment::new(8);
-    let waiter = {
-        let relay = relay.clone();
-        let req = post(
-            "/v0/pull?wait_ms=20000",
-            Some(&stranger.bearer()),
-            f.pull_bytes(0, 10),
-        );
-        tokio::spawn(async move { call(&relay, req).await })
-    };
-    while relay.poll_count() == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    push(&relay, &f, f.seal_n(1, 10)).await;
-    let reply = tokio::time::timeout(Duration::from_secs(5), waiter)
-        .await
-        .unwrap()
-        .unwrap();
-    reply.assert_error(401);
-}
-
-#[tokio::test]
 async fn long_poll_times_out_with_an_empty_batch() {
     let relay = mem_relay(Config::default());
     let f = Fragment::new(9);
@@ -252,9 +200,10 @@ async fn long_poll_times_out_with_an_empty_batch() {
 async fn wait_ms_is_clamped_to_25_seconds() {
     let relay = mem_relay(Config::default());
     let f = Fragment::new(10);
+    push(&relay, &f, f.seal_n(1, 10)).await;
     let started = tokio::time::Instant::now();
     // Virtual time: the test does not really sleep.
-    assert_eq!(pull(&relay, &f, 0, 10, 3_600_000).await, (0, false, vec![]));
+    assert_eq!(pull(&relay, &f, 1, 10, 3_600_000).await, (1, false, vec![]));
     let took = started.elapsed();
     assert!(
         took >= Duration::from_secs(25) && took < Duration::from_secs(26),
@@ -266,10 +215,11 @@ async fn wait_ms_is_clamped_to_25_seconds() {
 async fn abandoned_long_polls_free_their_slot() {
     let relay = mem_relay(Config::default());
     let f = Fragment::new(11);
+    push(&relay, &f, f.seal_n(1, 10)).await;
     let req = post(
         "/v0/pull?wait_ms=20000",
         Some(&f.bearer()),
-        f.pull_bytes(0, 10),
+        f.pull_bytes(1, 10),
     );
     let task = {
         let relay = relay.clone();
@@ -288,10 +238,11 @@ async fn abandoned_long_polls_free_their_slot() {
 async fn shutdown_releases_long_polls() {
     let relay = mem_relay(Config::default());
     let f = Fragment::new(12);
+    push(&relay, &f, f.seal_n(1, 10)).await;
     let req = post(
         "/v0/pull?wait_ms=20000",
         Some(&f.bearer()),
-        f.pull_bytes(0, 10),
+        f.pull_bytes(1, 10),
     );
     let task = {
         let relay = relay.clone();
@@ -305,7 +256,7 @@ async fn shutdown_releases_long_polls() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(batch(reply.message(), &f), (0, false, vec![]));
+    assert_eq!(batch(reply.message(), &f), (1, false, vec![]));
 }
 
 #[tokio::test]
@@ -630,6 +581,7 @@ async fn relay_wide_caps_get_507() {
         .await
         .assert_error(507);
     assert_eq!(pull(&relay, &b, 0, 0, 0).await, (0, false, vec![]));
+    assert_eq!(relay.fragment_count(), 1);
     // The failed push did not use up quota.
     assert_eq!(push(&relay, &b, b.seal_n(1, 100)).await, (1, 1));
 
@@ -662,12 +614,15 @@ async fn long_poll_caps_get_429() {
     let a = Fragment::new(27);
     let b = Fragment::new(28);
     let c = Fragment::new(29);
+    for f in [&a, &b, &c] {
+        push(&relay, f, f.seal_n(1, 10)).await;
+    }
     let hold = |f: &Fragment| {
         let relay = relay.clone();
         let req = post(
             "/v0/pull?wait_ms=20000",
             Some(&f.bearer()),
-            f.pull_bytes(0, 1),
+            f.pull_bytes(1, 1),
         );
         tokio::spawn(async move { call(&relay, req).await })
     };
@@ -689,7 +644,7 @@ async fn long_poll_caps_get_429() {
         post(
             "/v0/pull?wait_ms=20000",
             Some(&a.bearer()),
-            a.pull_bytes(0, 1),
+            a.pull_bytes(1, 1),
         ),
     )
     .await;
@@ -697,7 +652,7 @@ async fn long_poll_caps_get_429() {
     assert_eq!(r.headers["retry-after"], "1");
 
     // A pull that does not wait is not a long-poll and is never capped.
-    assert_eq!(pull(&relay, &a, 0, 1, 0).await, (0, false, vec![]));
+    assert_eq!(pull(&relay, &a, 1, 1, 0).await, (1, false, vec![]));
 
     // Another fragment takes the third slot; a fourth hits the global cap.
     let held_b = hold(&b);
@@ -707,7 +662,7 @@ async fn long_poll_caps_get_429() {
         post(
             "/v0/pull?wait_ms=20000",
             Some(&c.bearer()),
-            c.pull_bytes(0, 1),
+            c.pull_bytes(1, 1),
         ),
     )
     .await
@@ -748,6 +703,7 @@ async fn cors_headers_and_preflight() {
         assert_eq!(r.headers["access-control-allow-origin"], "*");
         let allowed = r.headers["access-control-allow-headers"].to_str().unwrap();
         assert!(allowed.contains("authorization") && allowed.contains("content-type"));
+        assert!(allowed.contains("x-gsp-registration"));
         assert!(
             r.headers["access-control-allow-methods"]
                 .to_str()

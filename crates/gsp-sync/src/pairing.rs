@@ -85,9 +85,22 @@ impl Pairing {
         id
     }
 
-    /// Bearer token for the relay: `derive_key("gsp/v0/relay-token", root)`.
-    pub fn relay_token(&self) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(blake3::derive_key(CTX_RELAY_TOKEN, &*self.root))
+    /// Bearer token for the relay at `relay_origin`:
+    /// `derive_key("gsp/v0/relay-token", root ‖ canonical_origin)`.
+    ///
+    /// The token is bound to the relay, so the operator of one relay cannot
+    /// use what it is shown to claim the fragment on another. `relay_origin`
+    /// is normalised with [`canonical_origin`] first; an origin that cannot
+    /// be normalised is an error.
+    pub fn relay_token(&self, relay_origin: &str) -> Result<Zeroizing<[u8; 32]>, OriginError> {
+        let origin = canonical_origin(relay_origin)?;
+        let mut material = Zeroizing::new(Vec::with_capacity(32 + origin.len()));
+        material.extend_from_slice(&*self.root);
+        material.extend_from_slice(origin.as_bytes());
+        Ok(Zeroizing::new(blake3::derive_key(
+            CTX_RELAY_TOKEN,
+            &material,
+        )))
     }
 
     /// Text form: `gsp0-` followed by the unpadded base64url of the 32 bytes.
@@ -138,6 +151,104 @@ impl Pairing {
         }
         Ok(Pairing { root })
     }
+}
+
+/// Why a relay origin was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginError {
+    /// Not `http://` or `https://`.
+    Scheme,
+    /// Empty host, or a host with characters outside `a-z 0-9 - .` (write
+    /// internationalised names in their `xn--` form), or a malformed
+    /// bracketed IPv6 literal.
+    Host,
+    /// A port that is not a decimal number from 1 to 65535.
+    Port,
+    /// Something after the host and port: a path, query, fragment or user
+    /// info. An origin has none of these.
+    Extra,
+}
+
+impl core::fmt::Display for OriginError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "gsp relay origin error: {self:?}")
+    }
+}
+impl core::error::Error for OriginError {}
+
+/// The canonical form of a relay origin, as bound into the relay token
+/// (SYNC-V0 section 2): `scheme://host[:port]`, where
+///
+/// - `scheme` is `http` or `https`, lowercase;
+/// - `host` is a lowercase ASCII host name or IPv4 address, or an IPv6
+///   address in brackets with lowercase hex digits (and otherwise as given:
+///   zero compression is not normalised);
+/// - `port` is decimal without leading zeros and is omitted when it is the
+///   scheme's default (80 for `http`, 443 for `https`);
+/// - nothing follows: no path, no trailing slash, no query, no fragment.
+///
+/// The input may differ from that in letter case, by an explicit default
+/// port, by leading zeros in the port and by one trailing `/`; anything else
+/// is an error.
+pub fn canonical_origin(origin: &str) -> Result<String, OriginError> {
+    let (scheme, rest) = origin.split_once("://").ok_or(OriginError::Scheme)?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80u16,
+        "https" => 443,
+        _ => return Err(OriginError::Scheme),
+    };
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.contains(['/', '?', '#', '@']) {
+        return Err(OriginError::Extra);
+    }
+    let (host, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let (addr, after) = v6.split_once(']').ok_or(OriginError::Host)?;
+        if addr.is_empty()
+            || !addr.contains(':')
+            || !addr
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit() || c == b':' || c == b'.')
+        {
+            return Err(OriginError::Host);
+        }
+        let port = match after.strip_prefix(':') {
+            Some(p) => Some(p),
+            None if after.is_empty() => None,
+            None => return Err(OriginError::Host),
+        };
+        (format!("[{}]", addr.to_ascii_lowercase()), port)
+    } else {
+        let (host, port) = match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
+        {
+            return Err(OriginError::Host);
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    let port = match port {
+        None => None,
+        Some(p) => {
+            if p.is_empty() || p.len() > 16 || !p.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(OriginError::Port);
+            }
+            match p.parse::<u16>() {
+                Ok(0) | Err(_) => return Err(OriginError::Port),
+                Ok(n) if n == default_port => None,
+                Ok(n) => Some(n),
+            }
+        }
+    };
+    Ok(match port {
+        Some(n) => format!("{scheme}://{host}:{n}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 /// Unpadded base64url (RFC 4648 section 5), as used for the pairing code and

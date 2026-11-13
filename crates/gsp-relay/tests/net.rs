@@ -330,13 +330,14 @@ async fn connections_past_the_cap_are_closed() {
 async fn graceful_shutdown_answers_held_long_polls_and_stops_listening() {
     let mut server = start(Config::default()).await;
     let f = Fragment::new(4);
+    push(&server.relay, &f, f.seal_n(1, 10)).await;
     let waiter = tokio::spawn(once(
         server.addr,
         request(
             "POST",
             "/v0/pull?wait_ms=25000",
             Some(&f.bearer()),
-            &f.pull_bytes(0, 10),
+            &f.pull_bytes(1, 10),
             false,
         ),
     ));
@@ -358,7 +359,7 @@ async fn graceful_shutdown_answers_held_long_polls_and_stops_listening() {
     assert_eq!(status, 200);
     assert_eq!(
         batch(Message::from_bytes(&body).unwrap(), &f),
-        (0, false, vec![])
+        (1, false, vec![])
     );
     tokio::time::timeout(Duration::from_secs(5), server.task)
         .await
