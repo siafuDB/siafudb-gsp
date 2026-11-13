@@ -24,6 +24,27 @@ pub enum Fsync {
     Never,
 }
 
+/// An operator secret. `Debug` never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Secret {
+        Secret(value.into())
+    }
+    /// The value. Do not log it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 /// Limits and policy for one relay instance.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -47,6 +68,13 @@ pub struct Config {
     pub total_quota_bytes: u64,
     /// Most fragments the relay will register (default 4096).
     pub max_fragments: usize,
+    /// If set, the first push to a new fragment must carry this value in the
+    /// `x-gsp-registration` header. Fragments that already exist are not
+    /// affected. Default: unset, anyone who can reach the relay may register.
+    pub registration_token: Option<Secret>,
+    /// Most request-body bytes being decoded at the same time (default
+    /// 8 MiB). A push that does not fit right now gets `503`.
+    pub max_decode_bytes: usize,
     /// Most concurrent long-polls on one fragment (default 8).
     pub max_polls_per_fragment: usize,
     /// Most concurrent long-polls overall (default 512).
@@ -73,6 +101,8 @@ impl Default for Config {
             fragment_quota_bytes: 64 * 1024 * 1024,
             total_quota_bytes: 4 * 1024 * 1024 * 1024,
             max_fragments: 4096,
+            registration_token: None,
+            max_decode_bytes: 8 * 1024 * 1024,
             max_polls_per_fragment: 8,
             max_polls: 512,
             max_connections: 1024,
@@ -103,6 +133,23 @@ impl Config {
                 return Err(format!("{name} must be greater than 0"));
             }
         }
+        if self.max_decode_bytes < self.max_request_bytes
+            || self.max_decode_bytes > (u32::MAX >> 4) as usize
+        {
+            return Err(
+                "max decode bytes must be at least max request bytes and below 256 MiB".into(),
+            );
+        }
+        if let Some(t) = &self.registration_token
+            && (t.expose().is_empty()
+                || hyper::header::HeaderValue::from_str(t.expose()).is_err()
+                || t.expose().trim() != t.expose())
+        {
+            return Err(
+                "registration token must be non-empty visible ASCII without surrounding spaces"
+                    .into(),
+            );
+        }
         if self.max_item_bytes > crate::dirstore::MAX_RECORD_BYTES {
             return Err(format!(
                 "max item bytes must be at most {}",
@@ -118,8 +165,11 @@ impl Config {
 pub struct Options {
     /// Listen address (default `127.0.0.1:8787`).
     pub addr: SocketAddr,
-    /// Directory for the durable store; `None` keeps everything in memory.
+    /// Directory for the durable store. `None` only together with
+    /// `in_memory`: [`parse`] refuses to choose the volatile store silently.
     pub data_dir: Option<PathBuf>,
+    /// Keep everything in memory (all data and cursors are lost on exit).
+    pub in_memory: bool,
     /// Fsync policy of the durable store.
     pub fsync: Fsync,
     /// Limits and CORS.
@@ -148,7 +198,9 @@ Each flag can also be set through the environment variable shown.
 A flag wins over the environment.
 
   --addr <ip:port>              GSP_RELAY_ADDR                    127.0.0.1:8787
-  --data-dir <path>             GSP_RELAY_DATA_DIR                (unset: in memory, lost on exit)
+  --data-dir <path>             GSP_RELAY_DATA_DIR                (required unless --in-memory)
+  --in-memory                   GSP_RELAY_IN_MEMORY=1             off; keep nothing on disk, lose
+                                                                  all data and cursors on exit
   --cors-origin <origin>        GSP_RELAY_CORS_ORIGIN             *
   --fsync <always|never>        GSP_RELAY_FSYNC                   always
   --max-item-bytes <n>          GSP_RELAY_MAX_ITEM_BYTES          262144
@@ -159,6 +211,9 @@ A flag wins over the environment.
   --fragment-quota-bytes <n>    GSP_RELAY_FRAGMENT_QUOTA_BYTES    67108864
   --total-quota-bytes <n>       GSP_RELAY_TOTAL_QUOTA_BYTES       4294967296
   --max-fragments <n>           GSP_RELAY_MAX_FRAGMENTS           4096
+  --registration-token <secret> GSP_RELAY_REGISTRATION_TOKEN      (unset: open registration)
+                                prefer the environment: flags show up in process listings
+  --max-decode-bytes <n>        GSP_RELAY_MAX_DECODE_BYTES        8388608
   --max-polls-per-fragment <n>  GSP_RELAY_MAX_POLLS_PER_FRAGMENT  8
   --max-polls <n>               GSP_RELAY_MAX_POLLS               512
   --max-connections <n>         GSP_RELAY_MAX_CONNECTIONS         1024
@@ -180,12 +235,26 @@ const FLAGS: &[&str] = &[
     "fragment-quota-bytes",
     "total-quota-bytes",
     "max-fragments",
+    "registration-token",
+    "max-decode-bytes",
+    "in-memory",
     "max-polls-per-fragment",
     "max-polls",
     "max-connections",
     "read-timeout-ms",
     "shutdown-grace-ms",
 ];
+
+/// Flags that take no value on the command line.
+const BOOL_FLAGS: &[&str] = &["in-memory"];
+
+fn truthy(flag: &str, v: &str) -> Result<bool, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("--{flag} ({}): expected 1 or 0", env_name(flag))),
+    }
+}
 
 fn env_name(flag: &str) -> String {
     format!("GSP_RELAY_{}", flag.replace('-', "_").to_uppercase())
@@ -218,6 +287,7 @@ where
         };
         let (name, value) = match body.split_once('=') {
             Some((n, v)) => (n.to_string(), v.to_string()),
+            None if BOOL_FLAGS.contains(&body) => (body.to_string(), "true".to_string()),
             None => {
                 let v = it.next().ok_or_else(|| format!("--{body} needs a value"))?;
                 (body.to_string(), v)
@@ -240,6 +310,7 @@ where
     let mut o = Options {
         addr: SocketAddr::from(([127, 0, 0, 1], 8787)),
         data_dir: None,
+        in_memory: false,
         fsync: Fsync::Always,
         config: Config::default(),
     };
@@ -250,6 +321,26 @@ where
             .map_err(|_| "--addr (GSP_RELAY_ADDR): expected ip:port".to_string())?;
     }
     o.data_dir = get("data-dir").map(PathBuf::from);
+    if let Some(v) = get("in-memory") {
+        o.in_memory = truthy("in-memory", &v)?;
+    }
+    match (&o.data_dir, o.in_memory) {
+        (None, false) => {
+            return Err(
+                "no storage chosen. Give --data-dir <path> (GSP_RELAY_DATA_DIR) to keep \
+                 items on disk, or --in-memory (GSP_RELAY_IN_MEMORY=1) to run without \
+                 persistence: all items and cursors are then lost when the relay stops."
+                    .into(),
+            );
+        }
+        (Some(_), true) => {
+            return Err("--data-dir and --in-memory exclude each other".into());
+        }
+        _ => {}
+    }
+    if let Some(v) = get("registration-token") {
+        o.config.registration_token = Some(Secret::new(v));
+    }
     if let Some(v) = get("cors-origin") {
         o.config.cors_origin = v;
     }
@@ -276,6 +367,7 @@ where
     set!("fragment-quota-bytes", c.fragment_quota_bytes);
     set!("total-quota-bytes", c.total_quota_bytes);
     set!("max-fragments", c.max_fragments);
+    set!("max-decode-bytes", c.max_decode_bytes);
     set!("max-polls-per-fragment", c.max_polls_per_fragment);
     set!("max-polls", c.max_polls);
     set!("max-connections", c.max_connections);
@@ -303,11 +395,12 @@ mod tests {
 
     #[test]
     fn defaults_env_and_flag_precedence() {
-        let Cli::Run(o) = run(&[], &[]).unwrap() else {
+        let Cli::Run(o) = run(&["--in-memory"], &[]).unwrap() else {
             panic!()
         };
         assert_eq!(o.addr.to_string(), "127.0.0.1:8787");
-        assert!(o.data_dir.is_none());
+        assert!(o.data_dir.is_none() && o.in_memory);
+        assert!(o.config.registration_token.is_none());
         assert_eq!(o.config.cors_origin, "*");
         assert_eq!(o.fsync, Fsync::Always);
 
@@ -316,6 +409,7 @@ mod tests {
             ("GSP_RELAY_DATA_DIR", "/var/lib/gsp"),
             ("GSP_RELAY_CORS_ORIGIN", "https://app.example"),
             ("GSP_RELAY_MAX_POLLS_PER_FRAGMENT", "3"),
+            ("GSP_RELAY_REGISTRATION_TOKEN", "s3cret-value"),
         ];
         let Cli::Run(o) = run(&["--addr", "127.0.0.1:1", "--max-polls=7"], &env).unwrap() else {
             panic!()
@@ -328,19 +422,43 @@ mod tests {
         assert_eq!(o.config.cors_origin, "https://app.example");
         assert_eq!(o.config.max_polls_per_fragment, 3);
         assert_eq!(o.config.max_polls, 7);
+        assert!(!o.in_memory);
+        let secret = o.config.registration_token.clone().unwrap();
+        assert_eq!(secret.expose(), "s3cret-value");
+        // The secret never appears in Debug output.
+        assert!(!format!("{o:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn storage_must_be_chosen_explicitly() {
+        // Neither: refuse, and say what to do.
+        let err = run(&[], &[]).unwrap_err();
+        assert!(err.contains("--data-dir") && err.contains("--in-memory"));
+        // Either one alone is fine, by flag or by environment.
+        assert!(run(&["--data-dir", "/x"], &[]).is_ok());
+        assert!(run(&["--in-memory"], &[]).is_ok());
+        assert!(run(&["--in-memory=true"], &[]).is_ok());
+        assert!(run(&[], &[("GSP_RELAY_IN_MEMORY", "1")]).is_ok());
+        assert!(run(&[], &[("GSP_RELAY_IN_MEMORY", "0")]).is_err());
+        assert!(run(&[], &[("GSP_RELAY_IN_MEMORY", "maybe")]).is_err());
+        // Both: refuse.
+        assert!(run(&["--data-dir", "/x", "--in-memory"], &[]).is_err());
+        assert!(run(&["--in-memory"], &[("GSP_RELAY_DATA_DIR", "/x")]).is_err());
     }
 
     #[test]
     fn rejects_bad_input() {
-        assert!(run(&["--nope", "1"], &[]).is_err());
-        assert!(run(&["positional"], &[]).is_err());
-        assert!(run(&["--addr"], &[]).is_err());
-        assert!(run(&["--addr", "localhost"], &[]).is_err());
-        assert!(run(&["--max-push-items", "-1"], &[]).is_err());
-        assert!(run(&["--max-push-items", "0"], &[]).is_err());
-        assert!(run(&["--fsync", "sometimes"], &[]).is_err());
-        assert!(run(&["--cors-origin", "bad\nvalue"], &[]).is_err());
-        assert!(run(&[], &[("GSP_RELAY_MAX_FRAGMENTS", "many")]).is_err());
+        assert!(run(&["--in-memory", "--nope", "1"], &[]).is_err());
+        assert!(run(&["--in-memory", "positional"], &[]).is_err());
+        assert!(run(&["--in-memory", "--addr"], &[]).is_err());
+        assert!(run(&["--in-memory", "--addr", "localhost"], &[]).is_err());
+        assert!(run(&["--in-memory", "--max-push-items", "-1"], &[]).is_err());
+        assert!(run(&["--in-memory", "--max-push-items", "0"], &[]).is_err());
+        assert!(run(&["--in-memory", "--fsync", "sometimes"], &[]).is_err());
+        assert!(run(&["--in-memory", "--cors-origin", "bad\nvalue"], &[]).is_err());
+        assert!(run(&["--in-memory"], &[("GSP_RELAY_MAX_FRAGMENTS", "many")]).is_err());
+        assert!(run(&["--in-memory", "--registration-token", ""], &[]).is_err());
+        assert!(run(&["--in-memory", "--max-decode-bytes", "10"], &[]).is_err());
         assert!(matches!(run(&["--help"], &[]), Ok(Cli::Help)));
         assert!(matches!(run(&["--version"], &[]), Ok(Cli::Version)));
     }

@@ -365,7 +365,8 @@ impl Signed {
 
     /// Strict parse. Does **not** verify anything.
     pub fn from_bytes(bytes: &[u8]) -> Result<Signed, DecodeError> {
-        let v = Value::decode(bytes)?;
+        // body, sigs, and at most 16 signatures of 6 items each.
+        let v = Value::decode_limited(bytes, 128)?;
         let mut f = Fields::exact(&v, 2, "signed envelope")?;
         let body = f.bytes()?.to_vec();
         let raw = f.array()?;

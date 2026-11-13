@@ -30,21 +30,47 @@ async fn shutdown_signal() {
 }
 
 async fn run(o: Options) -> std::io::Result<()> {
-    let relay = match &o.data_dir {
-        Some(dir) => Relay::new(o.config.clone(), DirStore::open(dir, o.fsync)?)?,
-        None => Relay::new(o.config.clone(), MemStore::new())?,
+    let (relay, store) = match &o.data_dir {
+        Some(dir) => (
+            Relay::new(o.config.clone(), DirStore::open(dir, o.fsync)?)?,
+            format!("dir:{} fsync={:?}", dir.display(), o.fsync),
+        ),
+        None => (
+            Relay::new(o.config.clone(), MemStore::new())?,
+            "memory".to_string(),
+        ),
     };
     let listener = tokio::net::TcpListener::bind(o.addr).await?;
     eprintln!(
-        "gsp-relay {} listening on http://{} store={} cors_origin={}",
+        "gsp-relay {} listening on http://{} store={store} cors_origin={} registration={}",
         env!("CARGO_PKG_VERSION"),
         listener.local_addr()?,
-        match &o.data_dir {
-            Some(dir) => format!("dir:{} fsync={:?}", dir.display(), o.fsync),
-            None => "memory (items are lost on exit; set --data-dir to keep them)".into(),
-        },
         o.config.cors_origin,
+        if o.config.registration_token.is_some() {
+            "secret-required"
+        } else {
+            "open"
+        },
     );
+    if o.data_dir.is_none() {
+        eprintln!(
+            "gsp-relay: WARNING: running --in-memory. Every item, token registration and \
+             cursor is lost when this process stops; clients will then see the relay \
+             restart numbering from 1."
+        );
+    } else if o.fsync == gsp_relay::Fsync::Never {
+        eprintln!(
+            "gsp-relay: WARNING: --fsync never. Items acknowledged shortly before an OS \
+             crash or power loss can be lost, and their cursors reused."
+        );
+    }
+    if o.config.registration_token.is_none() {
+        eprintln!(
+            "gsp-relay: note: registration is open. Anyone who can reach this relay can \
+             register fragments until its quotas are used up; set \
+             GSP_RELAY_REGISTRATION_TOKEN or restrict access in front of it."
+        );
+    }
     serve(listener, relay, shutdown_signal()).await
 }
 

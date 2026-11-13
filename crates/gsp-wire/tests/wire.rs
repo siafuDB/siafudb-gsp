@@ -1347,3 +1347,129 @@ fn sealed_plaintext_kinds_outside_1_to_3_are_rejected() {
         );
     }
 }
+
+// ------------------------------------------------- decoder cost on hostile input
+
+/// CBOR head for `major` with a 32-bit length.
+fn head32(major: u8, n: u32) -> Vec<u8> {
+    let mut v = vec![(major << 5) | 26];
+    v.extend_from_slice(&n.to_be_bytes());
+    v
+}
+
+#[test]
+fn map_key_order_is_enforced_at_the_first_offending_key() {
+    // 1 MiB that claims to be one big map. The first two keys are equal;
+    // everything after them is not even CBOR. A decoder that builds the map
+    // before checking keys would report `Cbor` (or run out of memory on a
+    // well-formed tail); one that checks as it goes reports the key.
+    const N: u32 = 300_000;
+    let mut dup = head32(5, N);
+    dup.extend_from_slice(&[0x61, b'a', 0x00, 0x61, b'a', 0x00]);
+    dup.resize(1 << 20, 0xff);
+    assert_eq!(Value::decode(&dup), Err(DecodeError::DuplicateKey));
+
+    let mut unsorted = head32(5, N);
+    unsorted.extend_from_slice(&[0x61, b'b', 0x00, 0x61, b'a', 0x00]);
+    unsorted.resize(1 << 20, 0xff);
+    assert_eq!(Value::decode(&unsorted), Err(DecodeError::NonCanonical));
+
+    // Length-first order: "b" sorts before "aa".
+    let mut by_len = head32(5, N);
+    by_len.extend_from_slice(&[0x62, b'a', b'a', 0x00, 0x61, b'b', 0x00]);
+    by_len.resize(1 << 20, 0xff);
+    assert_eq!(Value::decode(&by_len), Err(DecodeError::NonCanonical));
+
+    // The same inside a frame, nested, and a well-formed megabyte of
+    // duplicate keys: all fail on the second key, in no time.
+    let mut all_dup = head32(5, 349_524);
+    while all_dup.len() + 3 <= 1 << 20 {
+        all_dup.extend_from_slice(&[0x61, b'k', 0x00]);
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..200 {
+        assert_eq!(Value::decode(&all_dup), Err(DecodeError::DuplicateKey));
+        assert!(Message::from_bytes(&all_dup).is_err());
+    }
+    // 400 megabyte-sized hostile inputs. Building each map first costs
+    // seconds and tens of MiB apiece; failing at the second key costs
+    // microseconds. The bound is loose enough for any machine.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+    // Sorted keys still decode, and shortest-first order is the accepted one.
+    let ok = Value::Map(vec![
+        ("b".into(), Value::uint(1)),
+        ("aa".into(), Value::uint(2)),
+        ("a".into(), Value::uint(3)),
+    ])
+    .encode()
+    .unwrap();
+    assert!(Value::decode(&ok).is_ok());
+}
+
+#[test]
+fn item_limit_stops_a_frame_of_tiny_items_early() {
+    // 1 MiB array of one-byte integers: valid CBOR, and as a `Value` about
+    // thirty times its size. A frame may hold at most MAX_FRAME_ITEMS items,
+    // so the decoder refuses on reading the array head, before allocating.
+    let n = (1u32 << 20) - 5;
+    let mut big = head32(4, n);
+    big.resize(1 << 20, 0x00);
+    assert_eq!(
+        Value::decode_limited(&big, gsp_wire::message::MAX_FRAME_ITEMS),
+        Err(DecodeError::Shape("too many items"))
+    );
+    assert_eq!(
+        Message::from_bytes(&big),
+        Err(DecodeError::Shape("too many items"))
+    );
+    // Nested arrays that each stay under the limit but add up beyond it:
+    // refused when the budget runs out, and the garbage after that point is
+    // never looked at.
+    let mut nested = vec![0x82];
+    for _ in 0..2 {
+        nested.extend(head32(4, 40_000));
+        nested.resize(nested.len() + 40_000, 0x00);
+    }
+    let cut = nested.len() - 10_000;
+    nested.truncate(cut);
+    nested.resize(1 << 20, 0xff);
+    assert_eq!(
+        Value::decode_limited(&nested, gsp_wire::message::MAX_FRAME_ITEMS),
+        Err(DecodeError::Shape("too many items"))
+    );
+    // An array that claims more elements than there are bytes left is
+    // refused before anything is reserved for it.
+    let mut liar = head32(4, u32::MAX);
+    liar.extend_from_slice(&[0; 16]);
+    assert_eq!(Value::decode(&liar), Err(DecodeError::Cbor));
+    let mut liar = vec![0x9b];
+    liar.extend_from_slice(&u64::MAX.to_be_bytes());
+    assert_eq!(Value::decode(&liar), Err(DecodeError::Cbor));
+    let mut liar = vec![0xbb];
+    liar.extend_from_slice(&u64::MAX.to_be_bytes());
+    assert_eq!(Value::decode(&liar), Err(DecodeError::Cbor));
+
+    // The limit counts every item and is exact.
+    let v = Value::Array(vec![Value::uint(1), Value::Array(vec![Value::Null])]);
+    let enc = v.encode().unwrap();
+    assert_eq!(Value::decode_limited(&enc, 4), Ok(v));
+    assert_eq!(
+        Value::decode_limited(&enc, 3),
+        Err(DecodeError::Shape("too many items"))
+    );
+    // Real frames are far below it: a full default batch.
+    let sealed = SealedOp {
+        aead_alg: 1,
+        fragment_id: FRAG.to_vec(),
+        nonce: vec![0; 24],
+        ciphertext: vec![0; 64],
+    };
+    let batch = Message::Batch {
+        fragment_id: FRAG.to_vec(),
+        next: 256,
+        more: false,
+        sealed: vec![sealed; 256],
+    };
+    assert_eq!(Message::from_bytes(&batch.to_bytes().unwrap()), Ok(batch));
+}

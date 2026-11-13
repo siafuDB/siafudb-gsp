@@ -39,6 +39,11 @@ pub trait Store: Send + Sync + 'static {
     /// fragment must be left as it was before the call.
     fn append(&self, fragment_id: &[u8], first_seq: u64, items: &[Vec<u8>]) -> io::Result<()>;
 
+    /// Delete a fragment and everything stored for it. The relay calls this
+    /// only for a fragment that holds no items (a registration that did not
+    /// complete). Removing a fragment the store does not have is not an error.
+    fn remove(&self, fragment_id: &[u8]) -> io::Result<()>;
+
     /// Items with cursor greater than `after`, in order: at most `max_items`,
     /// stopping before the item that would push the total past `max_bytes`,
     /// but always at least one if any exists.
@@ -60,6 +65,9 @@ impl<S: Store> Store for std::sync::Arc<S> {
     }
     fn append(&self, fragment_id: &[u8], first_seq: u64, items: &[Vec<u8>]) -> io::Result<()> {
         (**self).append(fragment_id, first_seq, items)
+    }
+    fn remove(&self, fragment_id: &[u8]) -> io::Result<()> {
+        (**self).remove(fragment_id)
     }
     fn read(
         &self,
@@ -129,6 +137,11 @@ impl Store for MemStore {
             return Err(io::Error::other("append out of sequence"));
         }
         list.extend(items.iter().cloned());
+        Ok(())
+    }
+
+    fn remove(&self, fragment_id: &[u8]) -> io::Result<()> {
+        lock(&self.fragments).remove(fragment_id);
         Ok(())
     }
 

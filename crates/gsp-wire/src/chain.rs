@@ -40,7 +40,7 @@ impl EquivocationProof {
 
     /// Strict parse.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let v = Value::decode(bytes)?;
+        let v = Value::decode_limited(bytes, 4)?;
         let mut f = Fields::exact(&v, 2, "equivocation proof")?;
         let p = EquivocationProof {
             a: f.bytes()?.to_vec(),

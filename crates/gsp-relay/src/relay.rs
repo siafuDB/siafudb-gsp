@@ -10,6 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -32,13 +33,33 @@ impl Reject {
     }
 }
 
+/// What a request presented: the hash of its bearer relay token and, if the
+/// `x-gsp-registration` header was sent, the hash of that value.
+#[derive(Debug, Clone, Copy)]
+pub struct Auth {
+    /// `BLAKE3(relay_token)`.
+    pub token: TokenHash,
+    /// `BLAKE3` of the registration secret the client sent, if any.
+    pub registration: Option<TokenHash>,
+}
+
+impl Auth {
+    /// Credentials with a relay token only.
+    pub fn token(token: TokenHash) -> Auth {
+        Auth {
+            token,
+            registration: None,
+        }
+    }
+}
+
+const BUSY: Reject = Reject::new(503, "relay is busy decoding other requests");
 const BAD_TOKEN: Reject = Reject::new(401, "relay token rejected for this fragment");
 const STORAGE: Reject = Reject::new(500, "storage error");
 
 struct FragState {
-    /// The store has this fragment (its token hash is durable).
-    created: bool,
-    /// Cursor of the last stored item.
+    /// Cursor of the last stored item. Never 0: a fragment is registered
+    /// only together with its first item.
     head: u64,
     /// Bytes charged against the fragment quota.
     bytes: u64,
@@ -61,6 +82,13 @@ struct Inner {
     cfg: Config,
     store: Box<dyn Store>,
     frags: RwLock<HashMap<Vec<u8>, Arc<Frag>>>,
+    /// Serializes first pushes (registration), so limits are checked and the
+    /// store is written before a fragment becomes visible.
+    registering: Mutex<()>,
+    /// `BLAKE3` of the operator's registration secret, if one is set.
+    registration: Option<TokenHash>,
+    /// Bounds the request bytes being decoded at once.
+    decode: Arc<Semaphore>,
     total_bytes: AtomicU64,
     polls: Mutex<Polls>,
     shutdown: watch::Sender<bool>,
@@ -111,10 +139,6 @@ fn empty_batch(fragment_id: &[u8], next: u64) -> Message {
     }
 }
 
-fn is_empty_batch(m: &Message) -> bool {
-    matches!(m, Message::Batch { sealed, .. } if sealed.is_empty())
-}
-
 impl Relay {
     /// Build a relay on `store`, loading whatever the store already holds.
     pub fn new(cfg: Config, store: impl Store) -> io::Result<Relay> {
@@ -123,12 +147,21 @@ impl Relay {
         let mut frags = HashMap::new();
         let mut total = 0u64;
         let mut item_count = 0u64;
+        let mut purged = 0usize;
         for f in store.load()? {
             if !valid_fragment_id(&f.fragment_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "store returned an invalid fragment id",
                 ));
+            }
+            if f.items.is_empty() {
+                // Left by a crash between creating a fragment and storing its
+                // first item (or by a torn first record). No push to it was
+                // ever acknowledged; do not bring the registration back.
+                store.remove(&f.fragment_id)?;
+                purged += 1;
+                continue;
             }
             let bytes: u64 = f
                 .items
@@ -138,7 +171,6 @@ impl Relay {
             total += bytes;
             item_count += f.items.len() as u64;
             let state = FragState {
-                created: true,
                 head: f.items.len() as u64,
                 bytes,
                 seen: f.items.iter().map(|(h, _)| *h).collect(),
@@ -153,14 +185,22 @@ impl Relay {
         }
         info!(
             "loaded",
-            "fragments={} items={item_count} bytes={total}",
+            "fragments={} items={item_count} bytes={total} purged_empty={purged}",
             frags.len()
         );
+        let registration = cfg
+            .registration_token
+            .as_ref()
+            .map(|t| *blake3::hash(t.expose().as_bytes()).as_bytes());
+        let decode = Arc::new(Semaphore::new(cfg.max_decode_bytes));
         Ok(Relay {
             inner: Arc::new(Inner {
                 cfg,
                 store: Box::new(store),
                 frags: RwLock::new(frags),
+                registering: Mutex::new(()),
+                registration,
+                decode,
                 total_bytes: AtomicU64::new(total),
                 polls: Mutex::new(Polls::default()),
                 shutdown: watch::channel(false).0,
@@ -206,12 +246,36 @@ impl Relay {
         }
     }
 
+    fn may_register(&self, auth: &Auth) -> Result<(), Reject> {
+        match (&self.inner.registration, &auth.registration) {
+            (None, _) => Ok(()),
+            (Some(want), Some(got)) if same_token(want, got) => Ok(()),
+            _ => Err(Reject::new(
+                403,
+                "this relay requires a registration secret for new fragments",
+            )),
+        }
+    }
+
+    /// The checks that need only the fragment id, so a request can be turned
+    /// away before its body is decoded: the relay token for a registered
+    /// fragment, the registration secret for a new one.
+    pub fn preauth(&self, auth: &Auth, fragment_id: &[u8]) -> Result<(), Reject> {
+        match self.lookup(fragment_id) {
+            Some(f) if same_token(&f.token_hash, &auth.token) => Ok(()),
+            Some(_) => Err(BAD_TOKEN),
+            None => self.may_register(auth),
+        }
+    }
+
     /// Handle a `Push`. Blocking (disk I/O): call from a blocking thread.
     ///
-    /// All or nothing: if any check fails, no item of the push is stored.
+    /// All or nothing: if any check fails, no item of the push is stored. A
+    /// refused first push leaves nothing behind: the fragment is not
+    /// registered and the store is not touched.
     pub fn push(
         &self,
-        token: &TokenHash,
+        auth: &Auth,
         fragment_id: &[u8],
         sealed: &[SealedOp],
     ) -> Result<Message, Reject> {
@@ -238,69 +302,47 @@ impl Relay {
             }
             items.push(bytes);
         }
+        let count = u32::try_from(sealed.len()).unwrap_or(u32::MAX);
         let ack = |cursor| Message::Ack {
             fragment_id: fragment_id.to_vec(),
             cursor,
-            count: u32::try_from(sealed.len()).unwrap_or(u32::MAX),
+            count,
         };
 
-        let existing = self.lookup(fragment_id);
-        if let Some(f) = &existing
-            && !same_token(&f.token_hash, token)
-        {
+        let f = match self.lookup(fragment_id) {
+            Some(f) => f,
+            None if items.is_empty() => {
+                // Nothing to store, so nothing to register either.
+                self.may_register(auth)?;
+                return Ok(ack(0));
+            }
+            None => {
+                let _registering = lock(&self.inner.registering);
+                match self.lookup(fragment_id) {
+                    // Lost a race with another first push.
+                    Some(f) => f,
+                    None => {
+                        let head = self.register(auth, fragment_id, items, count)?;
+                        return Ok(ack(head));
+                    }
+                }
+            }
+        };
+        if !same_token(&f.token_hash, &auth.token) {
             return Err(BAD_TOKEN);
         }
-        if items.is_empty() {
-            // Nothing to store, so nothing to register either.
-            return Ok(ack(existing.map_or(0, |f| lock(&f.state).head)));
-        }
-        let f = match existing {
-            Some(f) => f,
-            None => self.register(fragment_id, token)?,
-        };
 
         let mut st = lock(&f.state);
-        if !st.created {
-            if let Err(e) = self.inner.store.create(fragment_id, &f.token_hash) {
-                warning!(
-                    "store_error",
-                    "op=create fragment={} kind={:?}",
-                    frag(fragment_id),
-                    e.kind()
-                );
-                // The registration stays (in memory only); the next push
-                // tries to create the file again.
-                return Err(STORAGE);
-            }
-            st.created = true;
-        }
-
-        // Byte-identical dedupe, against the log and within this push.
-        let mut fresh = Vec::with_capacity(items.len());
-        let mut fresh_hashes: Vec<[u8; 32]> = Vec::with_capacity(items.len());
-        let mut add = 0u64;
-        for item in items {
-            let h = *blake3::hash(&item).as_bytes();
-            if st.seen.contains(&h) || fresh_hashes.contains(&h) {
-                continue;
-            }
-            add += item.len() as u64 + ITEM_OVERHEAD;
-            fresh_hashes.push(h);
-            fresh.push(item);
-        }
+        let (fresh, hashes, add) = dedupe(Some(&st.seen), items);
         if fresh.is_empty() {
             return Ok(ack(st.head));
         }
         if st.bytes.saturating_add(add) > cfg.fragment_quota_bytes {
             return Err(Reject::new(413, "fragment quota exceeded"));
         }
-        let total = self.inner.total_bytes.fetch_add(add, Ordering::SeqCst);
-        if total.saturating_add(add) > cfg.total_quota_bytes {
-            self.inner.total_bytes.fetch_sub(add, Ordering::SeqCst);
-            return Err(Reject::new(507, "relay storage is full"));
-        }
+        self.reserve(add)?;
         if let Err(e) = self.inner.store.append(fragment_id, st.head + 1, &fresh) {
-            self.inner.total_bytes.fetch_sub(add, Ordering::SeqCst);
+            self.release(add);
             warning!(
                 "store_error",
                 "op=append fragment={} kind={:?}",
@@ -311,56 +353,95 @@ impl Relay {
         }
         st.head += fresh.len() as u64;
         st.bytes += add;
-        st.seen.extend(fresh_hashes);
+        st.seen.extend(hashes);
         let head = st.head;
         let used = st.bytes;
         drop(st);
         self.notify(fragment_id);
         info!(
             "push",
-            "fragment={} items={} stored={} bytes={} head={head} used={used}",
+            "fragment={} items={count} stored={} bytes={} head={head} used={used}",
             frag(fragment_id),
-            sealed.len(),
             fresh.len(),
             add - fresh.len() as u64 * ITEM_OVERHEAD
         );
         Ok(ack(head))
     }
 
-    fn register(&self, fragment_id: &[u8], token: &TokenHash) -> Result<Arc<Frag>, Reject> {
+    fn reserve(&self, add: u64) -> Result<(), Reject> {
+        let before = self.inner.total_bytes.fetch_add(add, Ordering::SeqCst);
+        if before.saturating_add(add) > self.inner.cfg.total_quota_bytes {
+            self.release(add);
+            return Err(Reject::new(507, "relay storage is full"));
+        }
+        Ok(())
+    }
+
+    fn release(&self, add: u64) {
+        self.inner.total_bytes.fetch_sub(add, Ordering::SeqCst);
+    }
+
+    /// First non-empty push to an unregistered fragment. The caller holds
+    /// the `registering` lock. Every limit is checked before the store is
+    /// touched, and the fragment becomes visible only once its first items
+    /// are stored. Returns the new head.
+    fn register(
+        &self,
+        auth: &Auth,
+        fragment_id: &[u8],
+        items: Vec<Vec<u8>>,
+        count: u32,
+    ) -> Result<u64, Reject> {
+        let cfg = &self.inner.cfg;
+        self.may_register(auth)?;
+        if self.fragment_count() >= cfg.max_fragments {
+            return Err(Reject::new(507, "relay has no room for another fragment"));
+        }
+        let (fresh, hashes, add) = dedupe(None, items);
+        if add > cfg.fragment_quota_bytes {
+            return Err(Reject::new(413, "fragment quota exceeded"));
+        }
+        self.reserve(add)?;
+        let store = &self.inner.store;
+        let stored = store.create(fragment_id, &auth.token).and_then(|()| {
+            store.append(fragment_id, 1, &fresh).inspect_err(|_| {
+                // Take the empty fragment back out. If even that fails, the
+                // next start removes it (it holds no items).
+                let _ = store.remove(fragment_id);
+            })
+        });
+        if let Err(e) = stored {
+            self.release(add);
+            warning!(
+                "store_error",
+                "op=register fragment={} kind={:?}",
+                frag(fragment_id),
+                e.kind()
+            );
+            return Err(STORAGE);
+        }
+        let head = fresh.len() as u64;
+        let f = Arc::new(Frag {
+            token_hash: auth.token,
+            state: Mutex::new(FragState {
+                head,
+                bytes: add,
+                seen: hashes.into_iter().collect(),
+            }),
+        });
         let mut map = self
             .inner
             .frags
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(f) = map.get(fragment_id) {
-            // Lost a race with another first push.
-            return if same_token(&f.token_hash, token) {
-                Ok(f.clone())
-            } else {
-                Err(BAD_TOKEN)
-            };
-        }
-        if map.len() >= self.inner.cfg.max_fragments {
-            return Err(Reject::new(507, "relay has no room for another fragment"));
-        }
-        let f = Arc::new(Frag {
-            token_hash: *token,
-            state: Mutex::new(FragState {
-                created: false,
-                head: 0,
-                bytes: 0,
-                seen: HashSet::new(),
-            }),
-        });
-        map.insert(fragment_id.to_vec(), f.clone());
+        map.insert(fragment_id.to_vec(), f);
         info!(
             "register",
-            "fragment={} fragments={}",
+            "fragment={} fragments={} items={count} stored={head} used={add}",
             frag(fragment_id),
             map.len()
         );
-        Ok(f)
+        Ok(head)
     }
 
     /// Answer a `Pull` from what is stored now, without waiting. Blocking
@@ -375,19 +456,38 @@ impl Relay {
         after: u64,
         limit: u32,
     ) -> Result<Message, Reject> {
+        self.pull_step(token, fragment_id, after, limit)
+            .map(|(m, _)| m)
+    }
+
+    /// As [`Relay::pull_now`], plus whether the request may be held as a
+    /// long-poll: only for a registered fragment, the right token, and
+    /// `after` exactly at the head.
+    fn pull_step(
+        &self,
+        token: &TokenHash,
+        fragment_id: &[u8],
+        after: u64,
+        limit: u32,
+    ) -> Result<(Message, bool), Reject> {
         let cfg = &self.inner.cfg;
         if !valid_fragment_id(fragment_id) {
             return Err(Reject::new(400, "invalid fragment id"));
         }
         let Some(f) = self.lookup(fragment_id) else {
-            return Ok(empty_batch(fragment_id, 0));
+            // Never held: anyone can ask about any id, so waiting here would
+            // let strangers use up the long-poll slots.
+            return Ok((empty_batch(fragment_id, 0), false));
         };
         if !same_token(&f.token_hash, token) {
             return Err(BAD_TOKEN);
         }
         let head = lock(&f.state).head;
         if after >= head {
-            return Ok(empty_batch(fragment_id, head));
+            // `after > head` means the client is ahead of this relay (the
+            // relay lost data and renumbered). Answer at once so the client
+            // sees `next < after` and can react.
+            return Ok((empty_batch(fragment_id, head), after == head));
         }
         let limit = match limit as usize {
             0 => cfg.max_batch_items,
@@ -419,12 +519,13 @@ impl Relay {
             frag(fragment_id),
             sealed.len()
         );
-        Ok(Message::Batch {
+        let batch = Message::Batch {
             fragment_id: fragment_id.to_vec(),
             next,
             more: next < head,
             sealed,
-        })
+        };
+        Ok((batch, false))
     }
 
     fn register_poll(&self, fragment_id: &[u8]) -> Result<PollGuard, Reject> {
@@ -464,10 +565,10 @@ impl Relay {
         fragment_id: &[u8],
         after: u64,
         limit: u32,
-    ) -> Result<Message, Reject> {
+    ) -> Result<(Message, bool), Reject> {
         let relay = self.clone();
         let id = fragment_id.to_vec();
-        tokio::task::spawn_blocking(move || relay.pull_now(&token, &id, after, limit))
+        tokio::task::spawn_blocking(move || relay.pull_step(&token, &id, after, limit))
             .await
             .unwrap_or(Err(STORAGE))
     }
@@ -475,18 +576,55 @@ impl Relay {
     /// Run [`Relay::push`] on the blocking pool.
     pub async fn push_async(
         &self,
-        token: TokenHash,
+        auth: Auth,
         fragment_id: Vec<u8>,
         sealed: Vec<SealedOp>,
     ) -> Result<Message, Reject> {
         let relay = self.clone();
-        tokio::task::spawn_blocking(move || relay.push(&token, &fragment_id, &sealed))
+        tokio::task::spawn_blocking(move || relay.push(&auth, &fragment_id, &sealed))
             .await
             .unwrap_or(Err(STORAGE))
     }
 
+    /// Decode a `Push` frame and handle it, both on the blocking pool.
+    ///
+    /// At most [`Config::max_decode_bytes`] of request bodies are being
+    /// decoded at any moment; a body that does not fit right now is refused
+    /// with `503` instead of queued.
+    pub async fn push_encoded(&self, auth: Auth, body: Vec<u8>) -> Result<Message, Reject> {
+        let permits = u32::try_from(body.len().max(1)).map_err(|_| BUSY)?;
+        let permit = self
+            .inner
+            .decode
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map_err(|_| BUSY)?;
+        let relay = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let decoded = Message::from_bytes(&body);
+            drop(body);
+            let result = match decoded {
+                Ok(Message::Push {
+                    fragment_id,
+                    sealed,
+                }) => relay.push(&auth, &fragment_id, &sealed),
+                Ok(_) => Err(Reject::new(400, "expected a Push frame")),
+                Err(_) => Err(Reject::new(400, "malformed frame")),
+            };
+            drop(permit);
+            result
+        })
+        .await
+        .unwrap_or(Err(STORAGE))
+    }
+
     /// Handle a `Pull`, holding it for up to `wait` (clamped to 25 s) while
     /// there is nothing after `after`.
+    ///
+    /// A pull is held only when the fragment is registered, the token is
+    /// right, and `after` equals the fragment's head. A pull on an
+    /// unregistered fragment, or with `after` beyond the head, is answered
+    /// at once whatever `wait` says.
     ///
     /// Past the long-poll caps the answer is `429`, not an empty `Batch`: an
     /// immediate empty reply would invite the client to retry in a tight loop.
@@ -499,8 +637,8 @@ impl Relay {
         wait: Duration,
     ) -> Result<Message, Reject> {
         let wait = wait.min(Duration::from_millis(crate::config::MAX_WAIT_MS));
-        let first = self.pull_blocking(token, fragment_id, after, limit).await?;
-        if wait.is_zero() || !is_empty_batch(&first) {
+        let (first, may_wait) = self.pull_blocking(token, fragment_id, after, limit).await?;
+        if wait.is_zero() || !may_wait {
             return Ok(first);
         }
         let mut shutdown = self.inner.shutdown.subscribe();
@@ -512,10 +650,8 @@ impl Relay {
         let mut guard = self.register_poll(fragment_id)?;
         let deadline = Instant::now() + wait;
         loop {
-            // Auth is re-checked here too: the fragment may have been
-            // registered, with another token, while this request waited.
-            let now = self.pull_blocking(token, fragment_id, after, limit).await?;
-            if !is_empty_batch(&now) {
+            let (now, may_wait) = self.pull_blocking(token, fragment_id, after, limit).await?;
+            if !may_wait {
                 return Ok(now);
             }
             tokio::select! {
@@ -528,4 +664,25 @@ impl Relay {
             }
         }
     }
+}
+
+/// Byte-identical dedupe against `seen` and within the push itself. Returns
+/// the items to store, their hashes, and the bytes they are charged.
+fn dedupe(
+    seen: Option<&HashSet<[u8; 32]>>,
+    items: Vec<Vec<u8>>,
+) -> (Vec<Vec<u8>>, Vec<[u8; 32]>, u64) {
+    let mut fresh = Vec::with_capacity(items.len());
+    let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(items.len());
+    let mut add = 0u64;
+    for item in items {
+        let h = *blake3::hash(&item).as_bytes();
+        if seen.is_some_and(|s| s.contains(&h)) || hashes.contains(&h) {
+            continue;
+        }
+        add += item.len() as u64 + ITEM_OVERHEAD;
+        hashes.push(h);
+        fresh.push(item);
+    }
+    (fresh, hashes, add)
 }

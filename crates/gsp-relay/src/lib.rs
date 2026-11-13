@@ -23,8 +23,8 @@ pub mod log;
 pub mod relay;
 pub mod store;
 
-pub use config::{Config, Fsync};
+pub use config::{Config, Fsync, Secret};
 pub use dirstore::DirStore;
 pub use http::serve;
-pub use relay::{Reject, Relay};
+pub use relay::{Auth, Reject, Relay};
 pub use store::{LoadedFragment, MemStore, Store, TokenHash};

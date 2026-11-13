@@ -156,7 +156,7 @@ impl SealedOp {
                 )
                 .map_err(|_| SealError::Decrypt)?,
         );
-        let v = Value::decode(&pt).map_err(SealError::Malformed)?;
+        let v = Value::decode_limited(&pt, 4).map_err(SealError::Malformed)?;
         let mut f = Fields::exact(&v, 2, "sealed plaintext").map_err(SealError::Malformed)?;
         let kind = f.u64().map_err(SealError::Malformed)?;
         let bytes = f.bytes().map_err(SealError::Malformed)?.to_vec();
@@ -209,6 +209,6 @@ impl SealedOp {
 
     /// Strict parse (no decryption).
     pub fn from_bytes(bytes: &[u8]) -> Result<SealedOp, DecodeError> {
-        SealedOp::from_value(&Value::decode(bytes)?)
+        SealedOp::from_value(&Value::decode_limited(bytes, 8)?)
     }
 }

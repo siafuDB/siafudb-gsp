@@ -25,7 +25,10 @@
 //! of a file, which loses the records after the damaged one; the number of
 //! bytes dropped is logged.
 //!
-//! One relay process per directory: there is no lock file.
+//! **Lock.** `<data_dir>/LOCK` is held with an exclusive advisory file lock
+//! for as long as the store is open, so a second relay cannot open the same
+//! directory. The OS drops the lock when the process ends, however it ends;
+//! the file itself stays and is harmless.
 
 use crate::config::Fsync;
 use crate::log::{frag, warning};
@@ -70,6 +73,8 @@ pub struct DirStore {
     dir: PathBuf,
     fsync: Fsync,
     fragments: Mutex<HashMap<Vec<u8>, Arc<Mutex<FragFile>>>>,
+    /// Held for its advisory lock; released when the store is dropped.
+    _lock: File,
 }
 
 fn hex(id: &[u8]) -> String {
@@ -112,15 +117,39 @@ fn header_bytes(fragment_id: &[u8], token_hash: &TokenHash) -> io::Result<Vec<u8
 }
 
 impl DirStore {
-    /// Use `data_dir` (created if missing). Files are read by
+    /// Use `data_dir` (created if missing) and take its lock. Fails with
+    /// [`io::ErrorKind::WouldBlock`]-style "in use" if another open store,
+    /// in this or any other process, holds the directory. Files are read by
     /// [`Store::load`], which the relay calls once at startup.
     pub fn open(data_dir: impl Into<PathBuf>, fsync: Fsync) -> io::Result<DirStore> {
-        let dir = data_dir.into().join("fragments");
+        let root = data_dir.into();
+        let dir = root.join("fragments");
         fs::create_dir_all(&dir)?;
+        let lock_path = root.join("LOCK");
+        let lock_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!(
+                        "{} is in use by another gsp-relay (lock held on {})",
+                        root.display(),
+                        lock_path.display()
+                    ),
+                ));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
         Ok(DirStore {
             dir,
             fsync,
             fragments: Mutex::new(HashMap::new()),
+            _lock: lock_file,
         })
     }
 
@@ -315,6 +344,18 @@ impl Store for DirStore {
         }
         ff.ends.extend(new_ends);
         Ok(())
+    }
+
+    fn remove(&self, fragment_id: &[u8]) -> io::Result<()> {
+        let dropped = lock(&self.fragments).remove(fragment_id);
+        drop(dropped);
+        let path = self.path(fragment_id);
+        let _ = fs::remove_file(path.with_extension("tmp"));
+        match fs::remove_file(&path) {
+            Ok(()) => sync_dir(&self.dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     fn read(

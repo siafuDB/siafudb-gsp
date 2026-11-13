@@ -165,9 +165,28 @@ impl Value {
     }
 
     /// Strict decode: exactly one item, canonical, nothing trailing.
+    ///
+    /// Map keys are checked for canonical order while decoding, so input
+    /// with duplicate or unsorted keys fails at the first offending key.
+    /// Memory use is bounded by the input: every array element and map
+    /// entry takes at least one input byte, and the result holds at most
+    /// one [`Value`] per input byte (plus the bytes of strings, which are
+    /// copied once). For input that has not been authenticated, prefer
+    /// [`Value::decode_limited`], which also bounds the number of items.
     pub fn decode(bytes: &[u8]) -> Result<Value, DecodeError> {
+        Value::decode_limited(bytes, usize::MAX)
+    }
+
+    /// [`Value::decode`], failing as soon as the input turns out to hold
+    /// more than `max_items` data items in total (every array, map, map
+    /// value and scalar counts as one). A [`Value`] takes several times the
+    /// memory of a one-byte item, so this is what keeps the cost of decoding
+    /// hostile input proportional to what a well-formed message of the
+    /// expected kind needs. The error is `Shape("too many items")`.
+    pub fn decode_limited(bytes: &[u8], max_items: usize) -> Result<Value, DecodeError> {
         let mut d = Decoder::new(bytes);
-        let v = decode_item(&mut d, 0)?;
+        let mut budget = max_items;
+        let v = decode_item(&mut d, 0, &mut budget)?;
         if d.position() != bytes.len() {
             return Err(DecodeError::Trailing);
         }
@@ -202,10 +221,17 @@ fn encode_float(v: f64, out: &mut Vec<u8>) {
     out.extend_from_slice(&v.to_bits().to_be_bytes());
 }
 
-fn decode_item(d: &mut Decoder<'_>, depth: usize) -> Result<Value, DecodeError> {
+fn decode_item(
+    d: &mut Decoder<'_>,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Value, DecodeError> {
     if depth > MAX_DEPTH {
         return Err(DecodeError::TooDeep);
     }
+    *budget = budget
+        .checked_sub(1)
+        .ok_or(DecodeError::Shape("too many items"))?;
     Ok(match d.datatype()? {
         Type::Null => {
             d.null()?;
@@ -228,33 +254,57 @@ fn decode_item(d: &mut Decoder<'_>, depth: usize) -> Result<Value, DecodeError> 
         Type::String => Value::Text(d.str()?.into()),
         Type::Array => {
             let n = d.array()?.ok_or(DecodeError::UnsupportedType)?;
-            // Every element takes at least one byte: bound before looping.
-            if n > (d.input().len() - d.position()) as u64 {
-                return Err(DecodeError::Cbor);
-            }
-            let mut items = Vec::new();
+            // Every element takes at least one byte and one unit of budget:
+            // bound before allocating, and allocate exactly once.
+            let n = claimed_len(n, d, *budget)?;
+            let mut items = Vec::with_capacity(n);
             for _ in 0..n {
-                items.push(decode_item(d, depth + 1)?);
+                items.push(decode_item(d, depth + 1, budget)?);
             }
             Value::Array(items)
         }
         Type::Map => {
             let n = d.map()?.ok_or(DecodeError::UnsupportedType)?;
-            if n > (d.input().len() - d.position()) as u64 {
-                return Err(DecodeError::Cbor);
-            }
-            let mut entries = Vec::new();
+            let n = claimed_len(n, d, *budget)?;
+            let mut entries = Vec::with_capacity(n);
+            // Encoded form of the previous key. Keys must be strictly
+            // ascending in this order (RFC 8949 4.2.1), which also rules out
+            // duplicates, and is checked here so that a hostile map fails at
+            // its first misplaced key, not after it has been built.
+            let mut last: Option<&[u8]> = None;
             for _ in 0..n {
                 if d.datatype()? != Type::String {
                     return Err(DecodeError::UnsupportedType);
                 }
+                let start = d.position();
                 let k: String = d.str()?.into();
-                entries.push((k, decode_item(d, depth + 1)?));
+                let enc = d.input().get(start..d.position()).ok_or(DecodeError::Cbor)?;
+                match last.map(|l| l.cmp(enc)) {
+                    Some(core::cmp::Ordering::Equal) => return Err(DecodeError::DuplicateKey),
+                    Some(core::cmp::Ordering::Greater) => return Err(DecodeError::NonCanonical),
+                    _ => {}
+                }
+                last = Some(enc);
+                entries.push((k, decode_item(d, depth + 1, budget)?));
             }
             Value::Map(entries)
         }
         _ => return Err(DecodeError::UnsupportedType),
     })
+}
+
+/// A claimed element count, checked against what the rest of the input and
+/// the item budget can possibly hold.
+fn claimed_len(n: u64, d: &Decoder<'_>, budget: usize) -> Result<usize, DecodeError> {
+    let left = d.input().len().saturating_sub(d.position());
+    let n = usize::try_from(n).map_err(|_| DecodeError::Cbor)?;
+    if n > left {
+        return Err(DecodeError::Cbor);
+    }
+    if n > budget {
+        return Err(DecodeError::Shape("too many items"));
+    }
+    Ok(n)
 }
 
 /// Cursor over the elements of a fixed-shape array, used by typed decoders.

@@ -1,8 +1,9 @@
 //! HTTP mapping of the relay (SYNC-V0 section 6) and the TCP server loop.
 
+use crate::config::Config;
 use crate::config::MAX_WAIT_MS;
 use crate::log::{info, warning};
-use crate::relay::{Reject, Relay};
+use crate::relay::{Auth, MAX_FRAGMENT_ID, Reject, Relay};
 use crate::store::TokenHash;
 use gsp_wire::Message;
 use http_body_util::{BodyExt, Full};
@@ -75,6 +76,125 @@ fn bearer<B>(req: &Request<B>) -> Result<TokenHash, Reject> {
     }
     let token = decode_token(value[7..].trim_ascii()).ok_or(MISSING)?;
     Ok(*blake3::hash(&token).as_bytes())
+}
+
+/// Header carrying the operator's registration secret on a first push.
+pub const REGISTRATION_HEADER: &str = "x-gsp-registration";
+
+fn credentials<B>(req: &Request<B>) -> Result<Auth, Reject> {
+    Ok(Auth {
+        token: bearer(req)?,
+        registration: req
+            .headers()
+            .get(REGISTRATION_HEADER)
+            .map(|v| *blake3::hash(v.as_bytes().trim_ascii()).as_bytes()),
+    })
+}
+
+const MALFORMED: Reject = Reject::new(400, "malformed frame");
+
+/// Allocation-free walk over CBOR item heads, used to turn away bodies of
+/// the wrong shape before paying for a full decode. It is a filter, not a
+/// parser: everything it lets through is still decoded strictly by
+/// `gsp-wire`, and it lets through every frame `gsp-wire` accepts.
+struct Scan<'a> {
+    body: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Scan<'a> {
+    /// Next item head: `(major type, argument)`.
+    fn head(&mut self) -> Option<(u8, u64)> {
+        let first = *self.body.get(self.pos)?;
+        self.pos += 1;
+        let width = match first & 0x1f {
+            n @ 0..=23 => return Some((first >> 5, u64::from(n))),
+            24 => 1,
+            25 => 2,
+            26 => 4,
+            27 => 8,
+            _ => return None,
+        };
+        let raw = self.body.get(self.pos..self.pos.checked_add(width)?)?;
+        self.pos += width;
+        let arg = raw.iter().fold(0u64, |a, b| (a << 8) | u64::from(*b));
+        Some((first >> 5, arg))
+    }
+    fn expect(&mut self, major: u8, arg: u64) -> Option<()> {
+        (self.head()? == (major, arg)).then_some(())
+    }
+    fn uint(&mut self) -> Option<u64> {
+        match self.head()? {
+            (0, v) => Some(v),
+            _ => None,
+        }
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let (2, len) = self.head()? else {
+            return None;
+        };
+        let end = self.pos.checked_add(usize::try_from(len).ok()?)?;
+        let out = self.body.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+    fn fragment_id(&mut self) -> Option<&'a [u8]> {
+        self.bytes()
+            .filter(|id| !id.is_empty() && id.len() <= MAX_FRAGMENT_ID)
+    }
+}
+
+/// Shape check of a `Push` body: `[3, bstr, [* [uint, uint, bstr, bstr,
+/// bstr]]]` and nothing else, with the item count and item sizes inside the
+/// limits. Returns the fragment id. Cost: a few head reads per item, no
+/// allocation, whatever the body contains.
+fn precheck_push<'a>(body: &'a [u8], cfg: &Config) -> Result<&'a [u8], Reject> {
+    let mut s = Scan { body, pos: 0 };
+    s.expect(4, 3).ok_or(MALFORMED)?;
+    s.expect(0, 3)
+        .ok_or(Reject::new(400, "expected a Push frame"))?;
+    let id = s.fragment_id().ok_or(MALFORMED)?;
+    let count = match s.head() {
+        Some((4, n)) => n,
+        _ => return Err(MALFORMED),
+    };
+    if count > cfg.max_push_items as u64 {
+        return Err(Reject::new(413, "too many items in one push"));
+    }
+    for _ in 0..count {
+        let start = s.pos;
+        let item = (|| {
+            s.expect(4, 5)?;
+            s.uint()?;
+            s.uint()?;
+            s.bytes()?;
+            s.bytes()?;
+            s.bytes()
+        })();
+        item.ok_or(MALFORMED)?;
+        if s.pos - start > cfg.max_item_bytes {
+            return Err(Reject::new(413, "item too large"));
+        }
+    }
+    if s.pos != body.len() {
+        return Err(MALFORMED);
+    }
+    Ok(id)
+}
+
+/// Shape check of a `Pull` body: `[4, bstr, uint, uint]`.
+fn precheck_pull(body: &[u8]) -> Result<(), Reject> {
+    let mut s = Scan { body, pos: 0 };
+    s.expect(4, 4).ok_or(MALFORMED)?;
+    s.expect(0, 4)
+        .ok_or(Reject::new(400, "expected a Pull frame"))?;
+    s.fragment_id().ok_or(MALFORMED)?;
+    s.uint().ok_or(MALFORMED)?;
+    s.uint().ok_or(MALFORMED)?;
+    if s.pos != body.len() {
+        return Err(MALFORMED);
+    }
+    Ok(())
 }
 
 /// Read a body, refusing as soon as more than `cap` bytes have arrived.
@@ -175,7 +295,7 @@ impl Relay {
                 resp.headers_mut()
                     .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             }
-            429 => {
+            429 | 503 => {
                 resp.headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             }
@@ -194,7 +314,7 @@ impl Relay {
         );
         h.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("authorization, content-type"),
+            HeaderValue::from_static("authorization, content-type, x-gsp-registration"),
         );
         h.insert(
             header::ACCESS_CONTROL_MAX_AGE,
@@ -203,34 +323,38 @@ impl Relay {
         self.finish(resp)
     }
 
-    async fn frame_body<B: Body>(&self, body: B, cap: usize) -> Result<Message, Reject> {
-        let bytes = read_body(body, cap, self.config().read_timeout)
+    async fn body<B: Body>(&self, body: B, cap: usize) -> Result<Vec<u8>, Reject> {
+        read_body(body, cap, self.config().read_timeout)
             .await
             .map_err(|e| match e {
                 BodyError::TooLarge => Reject::new(413, "request body too large"),
                 BodyError::Timeout => Reject::new(408, "request body not received in time"),
                 BodyError::Read => Reject::new(400, "request body could not be read"),
-            })?;
-        Message::from_bytes(&bytes).map_err(|_| Reject::new(400, "malformed frame"))
+            })
     }
 
+    /// Order matters here: everything cheap comes before the full decode.
+    /// Token syntax, body size (while reading), frame shape and limits (a
+    /// scan without allocation), then the relay token or the registration
+    /// secret; only then is the body decoded, off the async workers and
+    /// under the decode budget.
     async fn push_route<B: Body>(&self, req: Request<B>) -> Result<Message, Reject> {
-        let token = bearer(&req)?;
+        let auth = credentials(&req)?;
         let cap = self.config().max_request_bytes;
-        match self.frame_body(req.into_body(), cap).await? {
-            Message::Push {
-                fragment_id,
-                sealed,
-            } => self.push_async(token, fragment_id, sealed).await,
-            _ => Err(Reject::new(400, "expected a Push frame")),
-        }
+        let body = self.body(req.into_body(), cap).await?;
+        let fragment_id = precheck_push(&body, self.config())?;
+        self.preauth(&auth, fragment_id)?;
+        self.push_encoded(auth, body).await
     }
 
     async fn pull_route<B: Body>(&self, req: Request<B>) -> Result<Message, Reject> {
         let token = bearer(&req)?;
         let wait = wait_ms(req.uri().query())?;
         let cap = self.config().max_request_bytes.min(MAX_PULL_BODY);
-        match self.frame_body(req.into_body(), cap).await? {
+        let body = self.body(req.into_body(), cap).await?;
+        precheck_pull(&body)?;
+        // At most 1 KiB of flat fields: decoded in place.
+        match Message::from_bytes(&body).map_err(|_| MALFORMED)? {
             Message::Pull {
                 fragment_id,
                 after,
@@ -279,7 +403,7 @@ impl Relay {
         match result {
             Ok(m) => self.frame(StatusCode::OK, &m),
             Err(r) => {
-                if r.status != 429 {
+                if r.status != 429 && r.status != 503 {
                     info!("reject", "status={} reason={:?}", r.status, r.message);
                 }
                 self.reject(r)
