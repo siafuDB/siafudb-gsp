@@ -15,7 +15,7 @@ fn vectors() -> Vec<(&'static str, String)> {
     let mut put = |name: &'static str, bytes: &[u8]| out.push((name, hex::encode(bytes)));
 
     // ---- Vector 1: Ed25519-only author, genesis + first op.
-    let ed = SigningKey::from_seed(SigAlg::Ed25519, &[0x01; 32]);
+    let ed = SigningKey::ed25519(&[0x01; 32]);
     put("v1.ed25519_public_key", &ed.public().bytes);
     put("v1.key_id", &ed.public().key_id(1).unwrap().digest);
     let genesis_entry = KeyLogEntry {
@@ -112,42 +112,67 @@ fn vectors() -> Vec<(&'static str, String)> {
     };
     put("v3.message_pull", &pull.to_bytes().unwrap());
 
-    // ---- Vector 4: hybrid author. Too large to print: sizes and digests.
-    let pq = SigningKey::from_seed(SigAlg::MlDsa65, &[0x02; 32]);
-    let g = KeyLogEntry {
-        hash_alg: 1,
-        prev: None,
-        action: KeyLogAction::Genesis {
-            fragment_id: FRAG.to_vec(),
-            keys: vec![ed.public(), pq.public()],
-            policy: vec![1, 2],
-        },
+    // Needs ML-DSA signing; a build without the `ml-dsa` feature checks
+    // vectors 1 to 3 only.
+    #[cfg(feature = "ml-dsa")]
+    {
+        // ---- Vector 4: hybrid author. Too large to print: sizes and digests.
+        let pq = SigningKey::ml_dsa_65(&[0x02; 32]);
+        let g = KeyLogEntry {
+            hash_alg: 1,
+            prev: None,
+            action: KeyLogAction::Genesis {
+                fragment_id: FRAG.to_vec(),
+                keys: vec![ed.public(), pq.public()],
+                policy: vec![1, 2],
+            },
+        }
+        .sign(&[&ed, &pq])
+        .unwrap();
+        let hlog = KeyLog::genesis(&g).unwrap();
+        let hbody = OpBody {
+            author: hlog.author().clone(),
+            ..body.clone()
+        };
+        let hop = Op::sign(&hbody, &[&ed, &pq]).unwrap();
+        let hbytes = hop.to_bytes().unwrap();
+        assert!(verify(&hbytes, &VerifyCtx::new(FRAG, &hlog)).is_valid());
+        out.push(("v4.mldsa65_public_key_blake3", b3(&pq.public().bytes)));
+        out.push((
+            "v4.mldsa65_key_id",
+            hex::encode(pq.public().key_id(1).unwrap().digest),
+        ));
+        out.push(("v4.genesis_signed_len", g.len().to_string()));
+        out.push(("v4.genesis_signed_blake3", b3(&g)));
+        out.push(("v4.author_id", hex::encode(&hlog.author().digest)));
+        out.push(("v4.op_id", hex::encode(&hop.id().digest)));
+        let pq_sig = hop.sigs().iter().find(|s| s.alg == 2).unwrap();
+        out.push(("v4.mldsa65_signature_len", pq_sig.bytes.len().to_string()));
+        out.push(("v4.mldsa65_signature_blake3", b3(&pq_sig.bytes)));
+        out.push(("v4.op_signed_len", hbytes.len().to_string()));
+        out.push(("v4.op_signed_blake3", b3(&hbytes)));
+        // The two signed objects are also kept as files, so that a build
+        // without ML-DSA has real hybrid input to test against
+        // (tests/algorithms.rs).
+        fixture("v4_genesis_signed.bin", &g);
+        fixture("v4_op_signed.bin", &hbytes);
     }
-    .sign(&[&ed, &pq])
-    .unwrap();
-    let hlog = KeyLog::genesis(&g).unwrap();
-    let hbody = OpBody {
-        author: hlog.author().clone(),
-        ..body.clone()
-    };
-    let hop = Op::sign(&hbody, &[&ed, &pq]).unwrap();
-    let hbytes = hop.to_bytes().unwrap();
-    assert!(verify(&hbytes, &VerifyCtx::new(FRAG, &hlog)).is_valid());
-    out.push(("v4.mldsa65_public_key_blake3", b3(&pq.public().bytes)));
-    out.push((
-        "v4.mldsa65_key_id",
-        hex::encode(pq.public().key_id(1).unwrap().digest),
-    ));
-    out.push(("v4.genesis_signed_len", g.len().to_string()));
-    out.push(("v4.genesis_signed_blake3", b3(&g)));
-    out.push(("v4.author_id", hex::encode(&hlog.author().digest)));
-    out.push(("v4.op_id", hex::encode(&hop.id().digest)));
-    let pq_sig = hop.sigs().iter().find(|s| s.alg == 2).unwrap();
-    out.push(("v4.mldsa65_signature_len", pq_sig.bytes.len().to_string()));
-    out.push(("v4.mldsa65_signature_blake3", b3(&pq_sig.bytes)));
-    out.push(("v4.op_signed_len", hbytes.len().to_string()));
-    out.push(("v4.op_signed_blake3", b3(&hbytes)));
+
     out
+}
+
+/// Compare with the stored fixture; `GSP_WRITE_FIXTURES=1` rewrites it.
+#[cfg(feature = "ml-dsa")]
+fn fixture(name: &str, bytes: &[u8]) {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    if std::env::var_os("GSP_WRITE_FIXTURES").is_some() {
+        std::fs::write(&path, bytes).expect("write fixture");
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("fixture"),
+        bytes,
+        "{name} is stale: run with GSP_WRITE_FIXTURES=1"
+    );
 }
 
 #[test]

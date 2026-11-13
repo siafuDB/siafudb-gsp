@@ -472,7 +472,7 @@ struct Identity {
 }
 
 fn identity(fragment_id: &[u8], seed: &[u8; 32]) -> Result<Identity, Error> {
-    let signer = SigningKey::from_seed(SigAlg::Ed25519, seed);
+    let signer = SigningKey::ed25519(seed);
     let genesis = KeyLogEntry {
         hash_alg: HashAlg::Blake3_256.id(),
         prev: None,

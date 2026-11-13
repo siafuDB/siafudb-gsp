@@ -8,8 +8,16 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["ml-dsa"]
+# Verify ops of authors that sign with ML-DSA-65 (hybrid authors). A replica
+# itself always signs with Ed25519 only. Without the feature the `ml-dsa`
+# crate is not compiled; a hybrid author's key log is then not accepted and
+# its ops stay pending, as for any algorithm the build does not implement.
+ml-dsa = ["gsp-wire/ml-dsa"]
+
 [dependencies]
-gsp-wire = { path = "../gsp-wire", version = "0.1.0" }
+gsp-wire = { path = "../gsp-wire", version = "0.1.0", default-features = false }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 

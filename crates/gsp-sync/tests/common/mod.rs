@@ -330,7 +330,7 @@ impl Forge {
         genesis_for: Vec<u8>,
         seed: u8,
     ) -> Forge {
-        let signer = SigningKey::from_seed(SigAlg::Ed25519, &[seed; 32]);
+        let signer = SigningKey::ed25519(&[seed; 32]);
         let genesis = KeyLogEntry {
             hash_alg: 1,
             prev: None,

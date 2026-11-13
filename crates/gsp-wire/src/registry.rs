@@ -27,10 +27,32 @@ registry! {
     SigAlg {
         /// Ed25519 (RFC 8032), strict verification.
         Ed25519 = 1,
-        /// ML-DSA-65 (FIPS 204), empty context string.
+        /// ML-DSA-65 (FIPS 204), empty context string. Implemented only with
+        /// the `ml-dsa` cargo feature; see [`SigAlg::implemented`].
         MlDsa65 = 2,
     }
 }
+impl SigAlg {
+    /// `true` if this build can sign and verify with the algorithm. Ed25519
+    /// always; ML-DSA-65 only with the `ml-dsa` cargo feature.
+    pub const fn implemented(self) -> bool {
+        match self {
+            SigAlg::Ed25519 => true,
+            SigAlg::MlDsa65 => cfg!(feature = "ml-dsa"),
+        }
+    }
+
+    /// Look an id up among the algorithms this build implements. `None` for
+    /// an unregistered id and for a registered algorithm that was compiled
+    /// out: a verifier treats the two alike.
+    pub const fn supported(id: u16) -> Option<SigAlg> {
+        match SigAlg::from_id(id) {
+            Some(alg) if alg.implemented() => Some(alg),
+            _ => None,
+        }
+    }
+}
+
 registry! {
     /// Hash algorithms (multihash style: the id travels with the digest).
     HashAlg {

@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["ml-dsa"]
+# ML-DSA-65 (FIPS 204) signing and verification. Without it the `ml-dsa`
+# crate is not compiled, ML-DSA-65 keys cannot be created, and an ML-DSA-65
+# key or signature is handled like any algorithm this build does not
+# implement: `Unverifiable`, never valid, never invalid (WIRE-V0 section 2).
+ml-dsa = ["dep:ml-dsa"]
+
 [dependencies]
 # CBOR tokenizer/emitter. We hand-write every encoder on top of it so the
 # deterministic-encoding rules (RFC 8949 section 4.2) are ours, not serde's.
@@ -21,7 +29,7 @@ ed25519-dalek = { version = "3", default-features = false, features = [
   "fast",
   "zeroize",
 ] }
-ml-dsa = { version = "0.1", default-features = false, features = [
+ml-dsa = { version = "0.1", default-features = false, optional = true, features = [
   "alloc",
   "zeroize",
 ] }
