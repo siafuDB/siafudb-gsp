@@ -34,6 +34,9 @@
 //! 4. if [`Replica::forked`], tell the application: the device has to
 //!    [`Replica::reset_identity`] before it can write again.
 //!
+//! After restoring state that may be old (a backup), do a full pull before
+//! the application is allowed to write.
+//!
 //! The relay token is per relay: [`Replica::relay_token`] takes the relay's
 //! origin.
 //!
@@ -87,7 +90,11 @@
 //!   is wrong.
 //! - **Unverifiable ops are kept** ([`PendingReason::Unverifiable`]), within
 //!   the same bounds, and evaluated again after a restore.
-//! - **Rollback is detected.** See [`Replica::forked`].
+//! - **Rollback.** A rolled-back replica that pulls before it writes takes
+//!   its own later ops from the relay and carries on (fast-forward). One that
+//!   writes first has reused a position; that is detected when the earlier
+//!   op arrives, and the device must take a new identity. See
+//!   [`Replica::forked`].
 //!
 //! ## Other decisions where SYNC-V0 leaves room
 //!
@@ -99,6 +106,18 @@
 //! - **Stamp order** is `(hlc.wall_ms, hlc.counter, hash algorithm id, digest
 //!   bytes)`; changes within one op are ordered by position (see the `merge`
 //!   module source).
+//!
+//! ## Cargo features
+//!
+//! - **`ml-dsa`** (on by default) turns on `gsp-wire`'s feature of that
+//!   name: verification of authors that sign with Ed25519 + ML-DSA-65. A
+//!   replica's own identity is Ed25519 only either way. Without the feature
+//!   the `ml-dsa` crate is not compiled; the key log of a hybrid author is
+//!   then rejected as [`Reject::Unsupported`] (it cannot be checked, which
+//!   is not the same as invalid) and that author's ops are held as
+//!   [`PendingReason::UnknownAuthor`] within the usual bounds, for a build
+//!   that can read them. Leave it on unless every device of the fragment is
+//!   known to sign with Ed25519 alone.
 //!
 //! ## Not audited
 //!

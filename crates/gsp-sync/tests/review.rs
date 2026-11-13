@@ -393,7 +393,11 @@ fn an_own_op_that_does_not_chain_from_the_head_forks() {
     assert!(d.r.forked());
     // On the first device the conflict shows at position 2 itself.
     let out = a.ingest(&clone.sealed_op(&c2), 0, T0 + 4);
-    assert_eq!(out.status, IngestStatus::Applied, "the relay's branch is followed");
+    assert_eq!(
+        out.status,
+        IngestStatus::Applied,
+        "the relay's branch is followed"
+    );
     assert!(a.r.forked());
     assert_eq!(
         a.try_commit(&[node(5, &[], &[])], T0 + 5).unwrap_err(),

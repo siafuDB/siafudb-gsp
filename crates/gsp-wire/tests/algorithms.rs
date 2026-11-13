@@ -176,7 +176,10 @@ fn a_signature_of_an_unimplemented_algorithm_is_never_valid_and_never_invalid() 
     junk.key_id.digest = vec![9; 32];
     with_unknown.signed_mut().sigs.push(junk);
     assert_eq!(
-        verify(&with_unknown.to_bytes().unwrap(), &VerifyCtx::new(FRAG, &log)),
+        verify(
+            &with_unknown.to_bytes().unwrap(),
+            &VerifyCtx::new(FRAG, &log)
+        ),
         Verdict::Unverifiable {
             reason: UnverifiableReason::UnknownSigAlg
         }

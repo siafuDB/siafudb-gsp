@@ -37,6 +37,28 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # gsp-wire and gsp-sync without ML-DSA (the `ml-dsa` feature off): the
+  # Ed25519-only build a browser bundle can use. Built per package, so that
+  # the relay does not switch the feature back on through feature unification.
+  no-ml-dsa:
+    name: without ml-dsa (gsp-wire, gsp-sync)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo clippy -p gsp-wire -p gsp-sync --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo test -p gsp-wire -p gsp-sync --no-default-features --locked
+      - run: cargo check -p gsp-wire -p gsp-sync --no-default-features --target wasm32-unknown-unknown --locked
+      # The dependency must really be gone, not merely unused.
+      - run: |
+          if cargo tree -p gsp-sync --no-default-features -e normal --locked | grep -q 'ml-dsa'; then
+            echo "ml-dsa is still a dependency of gsp-sync without the feature" >&2
+            exit 1
+          fi
+
   wasm:
     name: wasm32 (gsp-wire, gsp-sync)
     runs-on: ubuntu-latest

@@ -31,6 +31,18 @@
 //! - **Sign-then-encrypt.** A relay sees a [`SealedOp`]: fragment id, nonce,
 //!   ciphertext.
 //!
+//! ## Cargo features
+//!
+//! - **`ml-dsa`** (on by default): ML-DSA-65 signing and verification, and
+//!   with it the `ml-dsa` dependency. A build without it (for example a
+//!   browser bundle for fragments whose devices all sign with Ed25519) has
+//!   no [`SigningKey::ml_dsa_65`] and treats ML-DSA-65 as what it then is: a
+//!   registered algorithm this build does not implement
+//!   ([`SigAlg::implemented`]). An op carrying such a signature is
+//!   [`Verdict::Unverifiable`], never valid and never invalid; a key log
+//!   that needs the algorithm is [`KeyLogError::Unsupported`]. Parsing, ids
+//!   and everything about Ed25519 are the same in both builds.
+//!
 //! ## Cryptography: maturity, stated plainly
 //!
 //! - `ml-dsa` is a **0.1.x** RustCrypto release. Its own README says it has

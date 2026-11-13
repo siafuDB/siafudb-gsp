@@ -330,15 +330,30 @@ fn a_copy_with_a_junk_signature_does_not_shadow_the_real_op() {
     assert_eq!(d.r.stats().pending, 0);
 }
 
+/// Compare with the stored fixture; `GSP_WRITE_FIXTURES=1` rewrites it.
+#[cfg(feature = "ml-dsa")]
+fn fixture(name: &str, bytes: &[u8]) {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    if std::env::var_os("GSP_WRITE_FIXTURES").is_some() {
+        std::fs::write(&path, bytes).expect("write fixture");
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("fixture"),
+        bytes,
+        "{name} is stale: run with GSP_WRITE_FIXTURES=1"
+    );
+}
+
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn a_hybrid_author_is_accepted_and_a_downgraded_op_is_not() {
     // Another device may choose Ed25519 + ML-DSA-65 at genesis. Its ops need
     // both signatures; stripping the post-quantum one must not get through.
-    use gsp_wire::{KeyLog, SigAlg, SigningKey};
+    use gsp_wire::{KeyLog, SigningKey};
     let pairing = Pairing::from_root(ROOT);
     let frag = pairing.fragment_id().to_vec();
-    let ed = SigningKey::from_seed(SigAlg::Ed25519, &[21; 32]);
-    let pq = SigningKey::from_seed(SigAlg::MlDsa65, &[22; 32]);
+    let ed = SigningKey::ed25519(&[21; 32]);
+    let pq = SigningKey::ml_dsa_65(&[22; 32]);
     let genesis = KeyLogEntry {
         hash_alg: 1,
         prev: None,
@@ -351,6 +366,9 @@ fn a_hybrid_author_is_accepted_and_a_downgraded_op_is_not() {
     .sign(&[&ed, &pq])
     .unwrap();
     let log = KeyLog::genesis(&genesis).unwrap();
+    // Kept as files for the test below, which also runs in builds that
+    // cannot make them.
+    fixture("hybrid_genesis.bin", &genesis);
     let mut sealer = Forge::new(ROOT, 9);
     let mut d = Dev::new(1);
     assert_eq!(
@@ -373,6 +391,7 @@ fn a_hybrid_author_is_accepted_and_a_downgraded_op_is_not() {
     };
     let full = Op::sign(&body, &[&ed, &pq]).unwrap();
     assert_eq!(full.sigs().len(), 2);
+    fixture("hybrid_op.bin", &full.to_bytes().unwrap());
     let ed_only = Op::sign(&body, &[&ed]).unwrap();
     assert_eq!(ed_only.id(), full.id());
     assert_eq!(
@@ -387,6 +406,51 @@ fn a_hybrid_author_is_accepted_and_a_downgraded_op_is_not() {
     assert_eq!(d.r.node(&gid(1)).unwrap().props, props(&[("k", int(1))]));
     // The state with a hybrid key log in it round-trips.
     d.restore();
+}
+
+/// A hybrid author's key log and first op, as made by a build with ML-DSA.
+/// With the `ml-dsa` feature the replica accepts both. Without it ML-DSA-65
+/// is an algorithm the build does not implement: the key log cannot be
+/// checked, so it is not accepted (and not called invalid), and the author's
+/// ops are held like those of any author whose key log is missing. Nothing
+/// else is affected.
+#[test]
+fn a_hybrid_author_with_and_without_the_ml_dsa_feature() {
+    let genesis: &[u8] = include_bytes!("fixtures/hybrid_genesis.bin");
+    let op: &[u8] = include_bytes!("fixtures/hybrid_op.bin");
+    let mut sealer = Forge::new(ROOT, 9);
+    let mut d = dev_knowing(&mut sealer);
+    let out_genesis = d.ingest(&sealer.seal(&Plain::KeyLog(genesis.to_vec())), 1, T0);
+    let out_op = d.ingest(&sealer.seal(&Plain::Op(op.to_vec())), 2, T0);
+    assert_eq!(d.r.cursor(), 2);
+    if cfg!(feature = "ml-dsa") {
+        assert_eq!(out_genesis.status, IngestStatus::KeyLog);
+        assert_eq!(out_op.status, IngestStatus::Applied);
+        assert_eq!(d.r.node(&gid(1)).unwrap().props, props(&[("k", int(1))]));
+    } else {
+        assert_eq!(rejected(&out_genesis), &Reject::Unsupported);
+        assert_eq!(
+            out_op.status,
+            IngestStatus::Pending(PendingReason::UnknownAuthor)
+        );
+        let st = d.r.stats();
+        assert_eq!((st.unsupported, st.invalid, st.pending), (1, 0, 1));
+        assert_eq!(st.authors, 2);
+        assert!(d.r.nodes().is_empty());
+        // Held across a restore, for a build that can read it.
+        d.restore();
+        assert!(d.poll(T0 + 1).is_empty());
+        assert_eq!(d.r.stats().pending, 1);
+    }
+    // Ed25519 authors, local commits and state work either way.
+    let mine = sealer.op(1, None, T0, &[node(2, &[], &[])]);
+    assert_eq!(
+        d.ingest(&sealer.sealed_op(&mine), 3, T0).status,
+        IngestStatus::Applied
+    );
+    d.commit(&[node(3, &[], &[])], T0 + 1);
+    d.restore();
+    assert!(d.r.node(&gid(2)).is_some() && d.r.node(&gid(3)).is_some());
 }
 
 // ------------------------------------------------------------ chains

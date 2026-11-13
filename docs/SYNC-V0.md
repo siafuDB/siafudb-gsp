@@ -183,20 +183,40 @@ different branches of that author's chain, and each rejects the ops of the
 other branch as they arrive (`prev` does not match). Because `deps` do not
 gate, this affects only what the equivocating author wrote; see section 8.
 
-**A device's own chain.** If a replica receives a validly signed op of _its
-own_ author that it did not record (beyond its head, or at a position where it
-holds a different op) then its state was rolled back (restored from a backup,
-or saved separately from a push), or a second device is running with a copy
-of its seed. Signing anything more as that author would equivocate, and peers
-would drop the ops without telling anyone. The replica therefore enters a
-**forked** state: local commits are refused with a distinct error, ingest goes
-on. It follows the version of its old chain that the relay has (applying
-those ops, and setting aside the conflicting ones it wrote itself, which stay
-merged locally). The application recovers by **resetting the identity**: a
-fresh device seed, a new genesis, and under it one new op for every
-set-aside op whose bytes the replica still holds (section 6), carrying the
-same changes under new stamps. To the other devices this is a new device
+**A device's own chain.** A replica can receive a validly signed op of _its
+own_ author that it did not record. Then its state was rolled back (restored
+from a backup, or saved separately from a push), or a second device is
+running with a copy of its seed. There are two cases.
+
+_Fast-forward._ The op is beyond the replica's head and continues from it
+(`seq = head + 1`, `prev` = the head). Nothing conflicts: the replica applies
+it like any other op, with effects, and its own head, next `seq` and HLC move
+forward with it. An op further ahead waits for the ones between, as for any
+author. The drift and horizon rules above are not applied to a replica's own
+ops: they carry its own earlier stamps, and it cannot rejoin its chain without
+them. From the first moment the replica has _seen_ an own op it has not yet
+applied, it refuses local commits (a distinct "own chain ahead" error) until
+its chain is applied up to the highest position seen. After that it writes as
+before, as the same author; nobody else can tell that anything happened.
+
+_Fork._ The op is at a position where the replica recorded a **different**
+op, or it claims to be the next op and does not continue from the head. The
+replica wrote after the rollback and before it had caught up, so one position
+now has two ops, and peers will have rejected one of them without telling
+anyone. Signing anything more as that author would repeat this. The replica
+enters a **forked** state: local commits are refused with a distinct error,
+ingest goes on. It follows the version of its old chain that the relay has
+(applying those ops, and setting aside the conflicting ones it wrote itself,
+which stay merged locally). The application recovers by **resetting the
+identity**: a fresh device seed, a new genesis, and under it one new op for
+every set-aside op whose bytes the replica still holds (section 6), carrying
+the same changes under new stamps. To the other devices this is a new device
 joining.
+
+A replica cannot know how many of its own ops a relay holds, so it cannot
+close the gap between the two cases by itself: **after restoring state that
+may be old, a client pulls to the relay's head before it lets the application
+write.**
 
 **Effects.** After applying ops, the replica emits the _difference in visible
 state_ as a list of `Change`s for the engine adapter: only winning writes, a
@@ -270,6 +290,11 @@ One round of a transport, for a replica `r`:
 4. **Resync when the replica asks** (section 5): cursor to 0 and pull again,
    with a growing delay between attempts.
 5. **Tell the application when the replica is forked** (section 5).
+6. **After a restore, pull before writing.** When the state may be older than
+   what was last pushed (it came from a backup, or the client cannot tell),
+   pull until a `Batch` has `more = false` before accepting local writes.
+   The replica then fast-forwards over its own ops (section 5). A write made
+   before that is a fork.
 
 ## 7. Replica state
 
@@ -312,13 +337,21 @@ could only keep as unverifiable is applied by a newer one.
   author that equivocates is by the trust rule of section 2 a device of the
   owner, so in practice this is a device whose state was rolled back; see the
   next point.
-- **Rollback recovery is partial.** A forked device (section 5) recovers by
-  taking a new identity. The ops it wrote on its own branch are re-issued only
-  if their bytes are still held (not yet echoed, or still in the outbox), which
-  is the normal case because detection happens at the first pull after the
-  rollback. If a concurrent write by another device fixed the endpoints of the
-  same edge in between, the forked device and the others can keep different
-  endpoints for that edge.
+- **Rollback is safe only if the client pulls first.** A rolled-back replica
+  that pulls before writing fast-forwards over its own ops and loses nothing
+  (section 5). One that writes first forks, and recovers by taking a new
+  identity. That recovery is partial: the ops it wrote on its own branch are
+  re-issued only if their bytes are still held (not yet echoed, or still in the
+  outbox), which is the normal case because detection happens at the first
+  pull after the rollback; and if a concurrent write by another device fixed
+  the endpoints of the same edge in between, the forked device and the others
+  can keep different endpoints for that edge. Fast-forward also depends on the
+  relay still holding the device's ops: if one is missing, the replica stays
+  in the "own chain ahead" state and only an identity reset gets it writing
+  again.
+- **A copied seed looks like a rollback.** Two devices running with one device
+  seed fast-forward over each other's ops until both write at the same
+  position; then both are forked. v0 has no way to tell this from a restore.
 - **A wiped relay loses history.** A client notices the reset and pushes again
   what was in flight (section 6.1). Ops that only the relay held (for a device
   that had not pulled them yet) are gone, and so are the key logs and early

@@ -95,6 +95,28 @@ a round trip even when unknown.
 | AeadAlg  | 1   | XChaCha20-Poly1305 | yes                                 |
 | AeadAlg  | 2   | AES-256-GCM        | registered only                     |
 
+**An implementation may omit an algorithm.** The table says what the Rust
+crate implements with its default features; built without its `ml-dsa`
+feature it does not implement ML-DSA-65, and a TypeScript port may start with
+Ed25519 alone. A registered algorithm that an implementation does not have is
+handled exactly like an id it has never heard of:
+
+- parsing is unaffected: keys, signatures and policies carrying the id are
+  read, kept and re-encoded unchanged, and content ids do not depend on it;
+- a signature of that algorithm cannot be checked, so the op is `Unverifiable`
+  (`UnknownSigAlg`), never `Valid`, and never `Invalid` on that ground
+  (section 6). A bad signature of an algorithm the implementation does have
+  still makes the op `Invalid`;
+- a key-log entry that needs the algorithm (a genesis or `SetPolicy` whose
+  policy lists it, or an entry signed with it) is not applied (section 5,
+  rule 5): the log stays where it was, and for a genesis there is no log;
+- the object is kept and evaluated again by software that has the algorithm.
+  It is not dropped as invalid and not counted against its author.
+
+So an Ed25519-only implementation can take full part in a fragment whose
+authors all have the policy `[1]`, and cannot verify, and so does not apply,
+the ops of a hybrid author.
+
 `format` is the structure version. This document defines `format = 0`. A
 structure with another `format` is `Unverifiable` (section 6), not invalid.
 

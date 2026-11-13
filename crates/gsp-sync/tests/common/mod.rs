@@ -6,7 +6,7 @@
 use gsp_sync::*;
 use gsp_wire::{
     FragmentKey, Hlc, KeyLog, KeyLogAction, KeyLogEntry, Multihash, Op, OpBody, Plain, SealedOp,
-    SigAlg, SigningKey, Value,
+    SigningKey, Value,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

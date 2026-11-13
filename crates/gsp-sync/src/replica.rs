@@ -1688,9 +1688,9 @@ impl Replica {
             unechoed: self.unechoed.len(),
             needs_resync: self.needs_resync(),
             forked: self.forked,
-            own_ops_missing: self.own_seen.saturating_sub(
-                self.authors.get(&self.me).map_or(0, |a| a.ops.len() as u64),
-            ),
+            own_ops_missing: self
+                .own_seen
+                .saturating_sub(self.authors.get(&self.me).map_or(0, |a| a.ops.len() as u64)),
         }
     }
 
