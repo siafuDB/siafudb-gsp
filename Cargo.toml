@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/siafudb-sync"]
+members = ["crates/siafudb-sync", "crates/gsp-wire"]
 
 # GSP: the SiafuDB Graph Sync Protocol, extracted from siafuDB/siafudb.
 # Engine-independent protocol pieces will move into their own crate
