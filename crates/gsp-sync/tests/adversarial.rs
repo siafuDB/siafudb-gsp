@@ -1036,7 +1036,7 @@ fn nothing_handed_to_the_outbox_contains_plaintext() {
     b.commit(&[node(1, &[], &[("reply", text(MARKER))])], T0 + 3);
 
     let pairing = Pairing::from_root(ROOT);
-    let secrets: Vec<(&str, Vec<u8>)> = vec![
+    let needles: Vec<(&str, Vec<u8>)> = vec![
         (
             "property value / label / key / type",
             MARKER.as_bytes().to_vec(),
@@ -1056,8 +1056,11 @@ fn nothing_handed_to_the_outbox_contains_plaintext() {
         assert!(dev.r.outbox_len() >= 2);
         for item in dev.r.outbox_peek(usize::MAX) {
             items += 1;
-            for (what, needle) in &secrets {
-                assert!(!contains(item, needle), "outbox item leaks the {what}");
+            for (what, needle) in &needles {
+                assert!(
+                    !contains(item, needle),
+                    "an outbox item contains a value that must stay private (see `needles`): {what}"
+                );
             }
             // What a relay does see: the fragment id, as the routing header.
             assert!(contains(item, &pairing.fragment_id()));
