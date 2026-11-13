@@ -106,7 +106,10 @@ fn round_trip_preserves_everything() {
     assert_eq!(back.cursor(), d.r.cursor());
     assert_eq!(back.author(), d.r.author());
     assert_eq!(back.fragment_id(), d.r.fragment_id());
-    assert_eq!(*back.relay_token(), *d.r.relay_token());
+    assert_eq!(
+        back.relay_token("https://relay.example"),
+        d.r.relay_token("https://relay.example")
+    );
     assert_eq!(back.equivocations(), d.r.equivocations());
     assert_eq!(back.outbox_peek(9), d.r.outbox_peek(9));
     assert!(back.node_deleted(&gid(3)) && back.edge_deleted(&gid(7)));
@@ -120,9 +123,9 @@ fn state_layout_is_tagged_and_versioned() {
     let (d, _) = busy();
     let bytes = d.r.to_bytes().unwrap();
     let items = value_of(&bytes);
-    assert_eq!(items.len(), 12);
+    assert_eq!(items.len(), 14);
     assert_eq!(items[0], text("gsp-sync-state"));
-    assert_eq!(items[1], int(0));
+    assert_eq!(items[1], int(1));
     assert_eq!(
         items[2],
         Value::Bytes(ROOT.to_vec()),
@@ -131,8 +134,12 @@ fn state_layout_is_tagged_and_versioned() {
     assert_eq!(items[3], Value::Bytes(vec![1; 32]), "and the device seed");
 
     let mut v = items.clone();
-    v[1] = int(1);
-    assert_eq!(restore(v).unwrap_err(), Error::StateVersion(1));
+    v[1] = int(2);
+    assert_eq!(restore(v).unwrap_err(), Error::StateVersion(2));
+    // The layout of the first version of this crate is not read either.
+    let mut v = items.clone();
+    v[1] = int(0);
+    assert_eq!(restore(v).unwrap_err(), Error::StateVersion(0));
     let mut v = items.clone();
     v[1] = Value::Int(i128::from(u64::MAX));
     assert_eq!(restore(v).unwrap_err(), Error::StateVersion(u64::MAX));
@@ -179,23 +186,23 @@ fn decoding_is_strict() {
     }
 
     // Authors out of order, duplicated, or without this device.
-    let authors = arr(&items[6]);
+    let authors = arr(&items[7]);
     assert_eq!(authors.len(), 4);
     let mut v = items.clone();
     let mut swapped = authors.clone();
     swapped.swap(0, 1);
-    v[6] = Value::Array(swapped);
+    v[7] = Value::Array(swapped);
     bad("authors unsorted", v);
     let mut v = items.clone();
     let mut dup = authors.clone();
     dup.push(authors[0].clone());
-    v[6] = Value::Array(dup);
+    v[7] = Value::Array(dup);
     bad("author twice", v);
     for skip in 0..authors.len() {
         let mut v = items.clone();
         let mut fewer = authors.clone();
         fewer.remove(skip);
-        v[6] = Value::Array(fewer);
+        v[7] = Value::Array(fewer);
         // Dropping any author breaks something: this device's own identity,
         // or nothing structural (a peer with no state is simply forgotten,
         // which is a different valid state only if it had no ops).
@@ -233,7 +240,7 @@ fn decoding_is_strict() {
     ops.swap(0, 1);
     fields[1] = Value::Array(ops);
     a[me] = Value::Array(fields);
-    v[6] = Value::Array(a);
+    v[7] = Value::Array(a);
     bad("head does not match op list", v);
     // An op id listed under two authors.
     let mut v = items.clone();
@@ -245,7 +252,7 @@ fn decoding_is_strict() {
     let mut fields = arr(&a[other]);
     fields[1] = Value::Array(vec![donor]);
     a[other] = Value::Array(fields);
-    v[6] = Value::Array(a);
+    v[7] = Value::Array(a);
     bad("op under two authors", v);
     // A key log with a broken signature.
     let mut v = items.clone();
@@ -258,18 +265,18 @@ fn decoding_is_strict() {
     g[last] ^= 1;
     fields[0] = Value::Bytes(g);
     a[0] = Value::Array(fields);
-    v[6] = Value::Array(a);
+    v[7] = Value::Array(a);
     bad("key log signature", v);
 
     // Merge state: an unused stamp, unsorted stamps, a stamp index out of
     // range, a node that is also tombstoned, nodes out of order.
-    let merge = arr(&items[7]);
+    let merge = arr(&items[8]);
     let stamps = arr(&merge[0]);
     let nodes = arr(&merge[1]);
     assert!(stamps.len() >= 3 && nodes.len() >= 3);
     let with_merge = |m: Vec<Value>| {
         let mut v = items.clone();
-        v[7] = Value::Array(m);
+        v[8] = Value::Array(m);
         v
     };
     let mut m = merge.clone();
@@ -306,24 +313,24 @@ fn decoding_is_strict() {
 
     // Pending: the same op twice.
     let mut v = items.clone();
-    let mut p = arr(&items[8]);
+    let mut p = arr(&items[9]);
     assert_eq!(p.len(), 3);
     p.push(p[0].clone());
-    v[8] = Value::Array(p);
+    v[9] = Value::Array(p);
     bad("pending twice", v);
     // Counters: wrong count, negative.
     let mut v = items.clone();
-    let mut c = arr(&items[10]);
+    let mut c = arr(&items[12]);
     c.push(int(0));
-    v[10] = Value::Array(c);
+    v[12] = Value::Array(c);
     bad("extra counter", v);
     let mut v = items.clone();
-    let mut c = arr(&items[10]);
+    let mut c = arr(&items[12]);
     c[0] = int(-1);
-    v[10] = Value::Array(c);
+    v[12] = Value::Array(c);
     bad("negative counter", v);
     // Wrong types at the top level.
-    for i in 2..12 {
+    for i in 2..14 {
         let mut v = items.clone();
         v[i] = text("nope");
         bad("wrong type", v);
@@ -431,10 +438,10 @@ fn a_restored_replica_carries_on_where_it_stopped() {
     for it in &items {
         peer.ingest(it, 0, T0 + 12);
     }
-    // The peer lacks the other authors, so the last op waits for its deps;
-    // the first two apply.
-    assert_eq!(peer.r.stats().applied, 2);
-    assert_eq!(peer.r.stats().pending, 1);
+    // The peer lacks the other authors that the last op names in `deps`.
+    // That does not matter: all three apply.
+    assert_eq!(peer.r.stats().applied, 3);
+    assert_eq!(peer.r.stats().pending, 0);
 }
 
 #[test]
@@ -477,7 +484,10 @@ fn create_is_deterministic_in_its_inputs() {
     assert_ne!(a.author(), d.author());
     assert_eq!(a.pairing().root(), &ROOT);
     assert_eq!(a.fragment_id(), &Pairing::from_root(ROOT).fragment_id());
-    assert_eq!(*a.relay_token(), *Pairing::from_root(ROOT).relay_token());
+    assert_eq!(
+        a.relay_token("https://relay.example"),
+        Pairing::from_root(ROOT).relay_token("https://relay.example")
+    );
 }
 
 #[test]

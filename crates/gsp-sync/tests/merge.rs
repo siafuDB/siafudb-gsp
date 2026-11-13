@@ -599,7 +599,14 @@ fn snapshot_rebuilds_the_visible_graph_in_an_empty_engine() {
 
 #[test]
 fn deps_are_capped_at_64_keeping_the_most_recent_heads() {
-    let mut d = Dev::new(1);
+    let mut d = Dev::with(
+        ROOT,
+        1,
+        Config {
+            max_authors: 100,
+            ..Config::default()
+        },
+    );
     d.drain();
     let mut heads = Vec::new();
     for i in 0..70u8 {

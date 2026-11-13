@@ -289,10 +289,11 @@ async fn adversarial_bodies_are_rejected_before_decoding() {
         let started = Instant::now();
         let r = call(&relay, post("/v0/push", Some(&f.bearer()), body)).await;
         assert_eq!(r.status.as_u16(), status, "{name}");
-        // Generous bound; the scan itself reads a handful of bytes. The
-        // unpatched path took ~200 ms per body in a debug build.
+        // Loose sanity bound only (reading 1 MiB dominates). That these
+        // bodies never reach the decoder is asserted on the scan itself, in
+        // the unit tests of `src/http.rs`.
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < Duration::from_secs(2),
             "{name} took {:?}",
             started.elapsed()
         );

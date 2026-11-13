@@ -278,7 +278,10 @@ fn decode_item(
                 }
                 let start = d.position();
                 let k: String = d.str()?.into();
-                let enc = d.input().get(start..d.position()).ok_or(DecodeError::Cbor)?;
+                let enc = d
+                    .input()
+                    .get(start..d.position())
+                    .ok_or(DecodeError::Cbor)?;
                 match last.map(|l| l.cmp(enc)) {
                     Some(core::cmp::Ordering::Equal) => return Err(DecodeError::DuplicateKey),
                     Some(core::cmp::Ordering::Greater) => return Err(DecodeError::NonCanonical),

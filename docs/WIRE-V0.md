@@ -52,6 +52,21 @@ with the rules above, and rejects the input unless the re-encoding is
 byte-identical. This is how the Rust implementation does it; it makes
 "canonical" a property that is checked rather than assumed.
 
+**Decoder cost.** Frames are decoded before anything is authenticated, so a
+decoder MUST NOT let the input decide how much it allocates:
+
+- a claimed array or map length larger than the number of input bytes left is
+  an error, checked before anything is reserved for it;
+- map keys are checked **while decoding**: each key's encoding MUST be
+  strictly greater, bytewise, than the previous one, and the decoder fails at
+  the first key that is not (equal: duplicate key; smaller: not canonical). A
+  megabyte of repeated keys fails at its second key;
+- a decoder bounds the total number of data items (arrays, maps, map values
+  and scalars each count as one) by what the structure being read can hold. An
+  in-memory item is many times larger than a one-byte item on the wire. The
+  Rust implementation allows 65 536 items per frame (section 10), 128 for a
+  `Signed` envelope, 8 for a `SealedOp` header and 4 for a `Plain`.
+
 **TypeScript notes.** Integers above `2^53` occur (`u64` clocks and sequence
 numbers fit, but the type allows the full range): decode integers as `bigint`
 or reject values you cannot represent, never round. JavaScript has one number

@@ -14,6 +14,13 @@
 //!    their targets, nodes go after their edges).
 //!
 //! The second property is the one an engine adapter depends on.
+//!
+//! A further test (`honest_ops_converge_despite_faults`) adds what the
+//! security review asked about: items that never reach a replica, an author
+//! whose clock runs ahead, an author who equivocates, and pending bounds
+//! small enough to be hit. There the claim is narrower and is the one that
+//! matters: every op of every honest author ends up applied on every honest
+//! replica, and they agree on everything but what the equivocator wrote.
 mod common;
 use common::*;
 use gsp_sync::*;
@@ -156,8 +163,14 @@ struct World {
 
 impl World {
     fn new(n: usize) -> World {
+        World::with(n, Config::default())
+    }
+
+    fn with(n: usize, config: Config) -> World {
         World {
-            devs: (0..n).map(|i| Dev::new(i as u8 + 1)).collect(),
+            devs: (0..n)
+                .map(|i| Dev::with(ROOT, i as u8 + 1, config))
+                .collect(),
             log: Vec::new(),
             pulled: vec![0; n],
             now: T0,
@@ -343,6 +356,259 @@ proptest! {
                 &*restored.devs[d].r.to_bytes().unwrap()
             );
             prop_assert_eq!(&plain.devs[d].model, &restored.devs[d].model);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- faults
+
+/// Gids only the equivocating author writes to.
+const MALLORY_NODES: u8 = 60;
+const HOUR: u64 = 3_600_000;
+
+#[derive(Debug, Clone)]
+enum Fault {
+    /// Something an honest device or its transport does.
+    Honest(Step),
+    /// An in-order pull in which the items picked by `mask` never arrive:
+    /// the cursor moves past them all the same.
+    LossyPull(usize, usize, u8),
+    /// The equivocator writes its next op. With `twin`, it writes two
+    /// different ops at that position, and continues its chain on one.
+    Mallory {
+        twin: bool,
+        twin_first: bool,
+        chain_on_twin: bool,
+    },
+    /// The author with the fast clock writes: two hours ahead (held by
+    /// everyone until then), or with `far` more than a year ahead (rejected).
+    Clocky { far: bool, key: usize },
+}
+
+fn fault(devs: usize) -> impl Strategy<Value = Fault> {
+    prop_oneof![
+        10 => step(devs).prop_map(Fault::Honest),
+        3 => (0..devs, 1usize..8, any::<u8>()).prop_map(|(d, n, m)| Fault::LossyPull(d, n, m)),
+        3 => (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+            |(twin, twin_first, chain_on_twin)| Fault::Mallory { twin, twin_first, chain_on_twin }
+        ),
+        3 => (proptest::bool::weighted(0.15), 0usize..3)
+            .prop_map(|(far, key)| Fault::Clocky { far, key }),
+    ]
+}
+
+/// An author driven by hand: the last op of its chain, and how many it made.
+struct Chain {
+    forge: Forge,
+    last: Option<gsp_wire::Op>,
+    wall: u64,
+}
+
+impl Chain {
+    fn new(seed: u8) -> Chain {
+        Chain {
+            forge: Forge::new(ROOT, seed),
+            last: None,
+            wall: 0,
+        }
+    }
+    fn seq(&self) -> u64 {
+        self.last.as_ref().map_or(1, |o| o.body().seq + 1)
+    }
+    fn make(&mut self, wall: u64, changes: &[Change]) -> gsp_wire::Op {
+        // Strictly increasing along the chain, as an honest author's HLC is.
+        self.wall = wall.max(self.wall + 1);
+        self.forge
+            .op(self.seq(), self.last.as_ref(), self.wall, changes)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        max_shrink_iters: 1000,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn honest_ops_converge_despite_faults(
+        n in 2usize..4,
+        faults in proptest::collection::vec(fault(3), 1..60),
+        seed in any::<u64>(),
+    ) {
+        // Bounds small enough that the stuck authors fill them.
+        let config = Config {
+            max_pending_items_per_author: 3,
+            max_pending_items: 7,
+            ..Config::default()
+        };
+        let mut w = World::with(n, config);
+        let mut mallory = Chain::new(90);
+        let mut clocky = Chain::new(91);
+        w.log.push(mallory.forge.sealed_genesis());
+        w.log.push(clocky.forge.sealed_genesis());
+        let mut clocky_stuck_at: Option<u64> = None;
+
+        for f in &faults {
+            match f {
+                Fault::Honest(s) => {
+                    let s = match s {
+                        Step::Commit(d, c) => Step::Commit(d % n, c.clone()),
+                        Step::Push(d) => Step::Push(d % n),
+                        Step::Deliver(d, i) => Step::Deliver(d % n, *i),
+                        Step::Pull(d, k) => Step::Pull(d % n, *k),
+                        Step::Restore(d) => Step::Restore(d % n),
+                    };
+                    w.run(&s);
+                }
+                Fault::LossyPull(d, k, mask) => {
+                    let d = d % n;
+                    w.now += 1;
+                    let from = w.pulled[d];
+                    let to = (from + k).min(w.log.len());
+                    for i in from..to {
+                        if mask >> (i % 8) & 1 == 1 {
+                            continue;
+                        }
+                        let item = w.log[i].clone();
+                        let now = w.clock(d);
+                        w.devs[d].ingest(&item, i as u64 + 1, now);
+                    }
+                    // What the transport does with `Batch.next`.
+                    w.devs[d].r.set_cursor(to as u64);
+                    prop_assert!(!w.devs[d].r.observe_relay_head(to as u64));
+                    w.pulled[d] = to;
+                }
+                Fault::Mallory { twin, twin_first, chain_on_twin } => {
+                    let g = MALLORY_NODES + (mallory.seq() % 3) as u8;
+                    let wall = w.now;
+                    let op = mallory.make(wall, &[node(g, &[], &[("m", int(1))])]);
+                    let mut items = vec![mallory.forge.sealed_op(&op)];
+                    let mut keep = op;
+                    if *twin {
+                        let other = mallory
+                            .forge
+                            .op(keep.body().seq, mallory.last.as_ref(), mallory.wall,
+                                &[node(g, &["twin"], &[("m", int(2))])]);
+                        items.push(mallory.forge.sealed_op(&other));
+                        if *twin_first {
+                            items.swap(0, 1);
+                        }
+                        if *chain_on_twin {
+                            keep = other;
+                        }
+                    }
+                    mallory.last = Some(keep);
+                    w.log.extend(items);
+                }
+                Fault::Clocky { far, key } => {
+                    // It writes to the gids the honest devices use.
+                    let lead = if *far { 400 * 24 * HOUR } else { 2 * HOUR };
+                    let wall = w.now + lead;
+                    let g = (clocky.seq() % u64::from(NODES)) as u8;
+                    let op = clocky.make(wall, &[node(g, &["C"], &[(KEYS[*key], text("clocky"))])]);
+                    if *far && clocky_stuck_at.is_none() {
+                        clocky_stuck_at = Some(op.body().seq);
+                    }
+                    w.log.push(clocky.forge.sealed_op(&op));
+                    clocky.last = Some(op);
+                }
+            }
+            // No replica ever has its cursor held back by what it could not
+            // use, and none is forked.
+            for d in &w.devs {
+                prop_assert!(!d.r.forked());
+            }
+        }
+
+        // Settle. Everyone pushes; three hours pass (so what was held for
+        // the clock can apply); every replica resyncs from the start of the
+        // relay log, as its transport does when `needs_resync` says so.
+        for d in 0..n {
+            w.push(d);
+        }
+        w.now += 3 * HOUR;
+        let mut rng = Rng(seed | 1);
+        for d in 0..n {
+            // First whatever random leftovers a flaky network delivers...
+            for _ in 0..w.log.len() / 2 {
+                let i = (rng.next() as usize) % w.log.len();
+                let item = w.log[i].clone();
+                let now = w.clock(d);
+                w.devs[d].ingest(&item, 0, now);
+            }
+            // ...then the resync.
+            w.devs[d].r.start_resync();
+            for i in 0..w.log.len() {
+                let item = w.log[i].clone();
+                let now = w.clock(d);
+                w.devs[d].ingest(&item, i as u64 + 1, now);
+                prop_assert_eq!(w.devs[d].r.cursor(), i as u64 + 1);
+            }
+            // A second replay changes nothing: replay is idempotent.
+            let before = (w.devs[d].r.nodes(), w.devs[d].r.edges());
+            for i in 0..w.log.len() {
+                let item = w.log[i].clone();
+                let now = w.clock(d);
+                let out = w.devs[d].ingest(&item, i as u64 + 1, now);
+                prop_assert!(out.effects.is_empty() && out.applied == 0);
+            }
+            prop_assert_eq!(&before, &(w.devs[d].r.nodes(), w.devs[d].r.edges()));
+        }
+
+        let honest_view = |d: &Dev| {
+            let nodes: Vec<NodeView> = d
+                .r
+                .nodes()
+                .into_iter()
+                .filter(|x| x.gid[0] < MALLORY_NODES)
+                .collect();
+            (nodes, d.r.edges())
+        };
+        let authors: Vec<(gsp_wire::Multihash, u64)> = w
+            .devs
+            .iter()
+            .map(|d| (d.r.author(), d.r.stats().local))
+            .collect();
+        let first = honest_view(&w.devs[0]);
+        for d in &w.devs {
+            // Every op of every honest author is applied on every replica.
+            let known = d.r.authors();
+            for (author, ops) in &authors {
+                let st = known.iter().find(|a| a.author == *author).expect("known");
+                prop_assert_eq!(st.applied_seq, *ops);
+                prop_assert_eq!(st.pending, 0);
+                prop_assert!(!st.gap && !st.equivocated);
+            }
+            // They agree on everything the equivocator did not write. That
+            // includes what the author with the fast clock wrote: its ops
+            // apply (or are refused) on all of them alike.
+            prop_assert_eq!(&honest_view(d), &first);
+            let c = known
+                .iter()
+                .find(|a| a.author == clocky.forge.author())
+                .expect("known");
+            let want = clocky_stuck_at.map_or(clocky.seq() - 1, |s| s - 1);
+            prop_assert_eq!(c.applied_seq, want);
+            // The model saw only local commits, corrections and effects.
+            d.check();
+            for e in d.r.edges() {
+                prop_assert!(d.r.node(&e.src).is_some() && d.r.node(&e.dst).is_some());
+            }
+            // Bounds held throughout; whatever is still pending belongs to
+            // the two faulty authors.
+            let st = d.r.stats();
+            prop_assert!(st.pending <= config.max_pending_items);
+            let faulty: usize = known
+                .iter()
+                .filter(|a| {
+                    a.author == clocky.forge.author() || a.author == mallory.forge.author()
+                })
+                .map(|a| a.pending)
+                .sum();
+            prop_assert_eq!(st.pending, faulty);
+            prop_assert!(!st.forked);
         }
     }
 }

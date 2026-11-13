@@ -479,3 +479,130 @@ pub async fn serve(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(m: &Message) -> Vec<u8> {
+        m.to_bytes().unwrap()
+    }
+
+    fn sealed(n: usize, id: &[u8]) -> Vec<gsp_wire::SealedOp> {
+        (0..n)
+            .map(|i| gsp_wire::SealedOp {
+                aead_alg: 1,
+                fragment_id: id.to_vec(),
+                nonce: vec![i as u8; 24],
+                ciphertext: vec![0xAB; 10 + i * 300],
+            })
+            .collect()
+    }
+
+    /// The scan must never refuse a frame `gsp-wire` produces.
+    #[test]
+    fn precheck_accepts_every_valid_frame_shape() {
+        let cfg = Config::default();
+        for id_len in [1usize, 16, 23, 24, 64] {
+            let id = vec![7u8; id_len];
+            for n in [0usize, 1, 2, 24, 64] {
+                let body = frame(&Message::Push {
+                    fragment_id: id.clone(),
+                    sealed: sealed(n, &id),
+                });
+                assert_eq!(precheck_push(&body, &cfg), Ok(&id[..]));
+            }
+            for (after, limit) in [(0, 0), (23, 24), (u64::MAX, u32::MAX)] {
+                let body = frame(&Message::Pull {
+                    fragment_id: id.clone(),
+                    after,
+                    limit,
+                });
+                assert_eq!(precheck_pull(&body), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn precheck_applies_the_limits() {
+        let id = [7u8; 16];
+        let cfg = Config {
+            max_push_items: 3,
+            max_item_bytes: 600,
+            ..Config::default()
+        };
+        let push = |n| {
+            frame(&Message::Push {
+                fragment_id: id.to_vec(),
+                sealed: sealed(n, &id),
+            })
+        };
+        assert!(precheck_push(&push(2), &cfg).is_ok());
+        // Third item is 10 + 2 * 300 bytes of ciphertext plus its header.
+        assert_eq!(precheck_push(&push(3), &cfg).unwrap_err().status, 413);
+        assert_eq!(precheck_push(&push(4), &cfg).unwrap_err().status, 413);
+        // Wrong frame type, bad fragment ids, trailing bytes, truncation.
+        let pull = frame(&Message::Pull {
+            fragment_id: id.to_vec(),
+            after: 0,
+            limit: 1,
+        });
+        assert_eq!(precheck_push(&pull, &cfg).unwrap_err().status, 400);
+        assert_eq!(precheck_pull(&push(1)).unwrap_err().status, 400);
+        for bad_id in [vec![], vec![1u8; 65]] {
+            let body = frame(&Message::Pull {
+                fragment_id: bad_id,
+                after: 0,
+                limit: 1,
+            });
+            assert_eq!(precheck_pull(&body).unwrap_err().status, 400);
+        }
+        let good = push(2);
+        for cut in 0..good.len() {
+            assert_eq!(precheck_push(&good[..cut], &cfg).unwrap_err().status, 400);
+        }
+        let trailing = [good, vec![0]].concat();
+        assert_eq!(precheck_push(&trailing, &cfg).unwrap_err().status, 400);
+    }
+
+    /// The reviewer's amplification bodies stop at the scan: at the first
+    /// byte that is not the head of a five-element array, or at the item
+    /// count, having read fewer than 16 bytes and allocated nothing.
+    #[test]
+    fn precheck_stops_amplification_bodies_at_the_first_wrong_byte() {
+        let cfg = Config::default();
+        let n: usize = (1024 * 1024 - 32) / 2;
+        let mut map_body = vec![0x83, 0x03, 0x41, 0x01, 0x81, 0xba];
+        map_body.extend_from_slice(&(n as u32).to_be_bytes());
+        map_body.resize(map_body.len() + 2 * n, 0x60);
+        assert_eq!(precheck_push(&map_body, &cfg), Err(MALFORMED));
+        // Same verdict from the first 16 bytes alone: nothing past them
+        // was needed to refuse.
+        assert_eq!(precheck_push(&map_body[..16], &cfg), Err(MALFORMED));
+
+        let n: usize = 1024 * 1024 - 16;
+        let mut array_body = vec![0x83, 0x03, 0x41, 0x01, 0x9a];
+        array_body.extend_from_slice(&(n as u32).to_be_bytes());
+        array_body.resize(array_body.len() + n, 0xf6);
+        assert_eq!(precheck_push(&array_body, &cfg).unwrap_err().status, 413);
+        assert_eq!(
+            precheck_push(&array_body[..9], &cfg).unwrap_err().status,
+            413
+        );
+
+        // Length fields that point past the body or overflow.
+        for liar in [
+            &[
+                0x83, 0x03, 0x41, 0x01, 0x81, 0x85, 0x00, 0x01, 0x5b, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff,
+            ][..],
+            &[
+                0x83, 0x03, 0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ][..],
+            &[0x83, 0x03, 0x41, 0x01, 0x9b, 0, 0, 0, 0, 0, 0, 0, 1][..],
+            &[0x83, 0x03, 0x41, 0x01, 0x9f][..],
+        ] {
+            assert_eq!(precheck_push(liar, &cfg), Err(MALFORMED));
+        }
+    }
+}

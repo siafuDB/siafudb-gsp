@@ -2,7 +2,7 @@
 //! items, pull them back, open them, and hold a long-poll.
 //!
 //! ```text
-//! gsp-relay --addr 127.0.0.1:8787 &
+//! gsp-relay --in-memory --addr 127.0.0.1:8787 &
 //! cargo run -p gsp-relay --example roundtrip -- 127.0.0.1:8787
 //! ```
 //!
@@ -42,9 +42,14 @@ fn post(addr: &str, path: &str, token: &[u8; 32], frame: &Message) -> Res<(u16, 
     write!(
         s,
         "POST {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\
-         authorization: Bearer {}\r\ncontent-type: application/cbor\r\n\
+         authorization: Bearer {}\r\ncontent-type: application/cbor\r\n{}\
          content-length: {}\r\n\r\n",
         b64url(token),
+        // Only a relay that requires it looks at this header, and only on
+        // the first push to a new fragment.
+        std::env::var("GSP_RELAY_REGISTRATION_TOKEN")
+            .map(|t| format!("x-gsp-registration: {t}\r\n"))
+            .unwrap_or_default(),
         body.len()
     )?;
     s.write_all(&body)?;
@@ -93,6 +98,12 @@ fn main() -> Res<()> {
 
     let (status, reply) = post(&addr, "/v0/pull", &token, &pull(0, 10))?;
     println!("pull before any push  -> {status} {reply:?}");
+    let started = Instant::now();
+    let (status, _) = post(&addr, "/v0/pull?wait_ms=5000", &token, &pull(0, 10))?;
+    println!(
+        "long-poll wait_ms=5000 before any push -> {status} after {} ms (not held: unregistered)",
+        started.elapsed().as_millis()
+    );
 
     let (status, reply) = post(&addr, "/v0/push", &token, &push(sealed.clone()))?;
     println!("push 3 items          -> {status} {reply:?}");

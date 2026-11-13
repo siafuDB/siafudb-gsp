@@ -3,7 +3,7 @@
 use crate::change::{Change, Gid, PayloadError, decode_payload, encode_payload};
 use crate::cv::{Fields, bytes, uint};
 use crate::merge::{EdgeView, Merge, NodeView, OpKey, Stamp};
-use crate::pairing::{FRAGMENT_ID_LEN, Pairing};
+use crate::pairing::{FRAGMENT_ID_LEN, OriginError, Pairing};
 use gsp_wire::op::MAX_DEPS;
 use gsp_wire::{
     DecodeError, EncodeError, EquivocationProof, FragmentKey, HashAlg, Hlc, InvalidReason, KeyLog,
@@ -22,27 +22,48 @@ pub const MAX_SEALED_BYTES: usize = 256 * 1024;
 pub const MAX_EQUIVOCATIONS: usize = 64;
 
 const STATE_TAG: &str = "gsp-sync-state";
-const STATE_VERSION: u64 = 0;
+const STATE_VERSION: u64 = 1;
+const CTX_RESET_NONCE: &str = "gsp/v0/reset-identity-nonce";
 
 /// Tunable limits. Not part of the serialised state: pass the same values to
-/// [`Replica::from_bytes`].
+/// [`Replica::from_bytes`]. Build it from [`Config::default`] with struct
+/// update syntax; fields may be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// How far an op's HLC may lead the local clock before the op is held
-    /// back. Default 300 000 ms (WIRE-V0 section 4).
+    /// How far an op's HLC may lead the local clock and still be applied at
+    /// once. Beyond it the op is held. Default 300 000 ms (WIRE-V0 section 4).
     pub max_drift_ms: u64,
-    /// Most ops held as pending.
+    /// How far an op's HLC may lead the local clock and still be *held*.
+    /// Beyond it the op is rejected. Default 86 400 000 ms (24 hours).
+    pub max_clock_ahead_ms: u64,
+    /// Most ops held as pending, all authors together. Default 4096.
     pub max_pending_items: usize,
-    /// Most bytes of signed ops held as pending.
+    /// Most bytes of signed ops held as pending, all authors together.
+    /// Default 16 MiB.
     pub max_pending_bytes: usize,
+    /// Most ops held as pending for one author. Default 256.
+    pub max_pending_items_per_author: usize,
+    /// Most bytes of signed ops held as pending for one author. Default 2 MiB.
+    pub max_pending_bytes_per_author: usize,
+    /// Most authors (devices) whose key log a replica accepts, this device
+    /// included. Default 64.
+    pub max_authors: usize,
+    /// Most acknowledged outbox items kept until the relay echoes them back.
+    /// Default 1024.
+    pub max_unechoed_items: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             max_drift_ms: gsp_wire::op::DEFAULT_MAX_DRIFT_MS,
+            max_clock_ahead_ms: 24 * 60 * 60 * 1000,
             max_pending_items: 4096,
             max_pending_bytes: 16 * 1024 * 1024,
+            max_pending_items_per_author: 256,
+            max_pending_bytes_per_author: 2 * 1024 * 1024,
+            max_authors: 64,
+            max_unechoed_items: 1024,
         }
     }
 }
@@ -58,6 +79,9 @@ pub enum Error {
     Seal(SealError),
     /// The sealed op would exceed [`MAX_SEALED_BYTES`].
     TooLarge,
+    /// This device's author chain has forked (see [`Replica::forked`]): the
+    /// replica refuses to sign. Call [`Replica::reset_identity`].
+    Forked,
     /// State bytes are not a canonical replica state (what was wrong).
     State(&'static str),
     /// State bytes are from a state version this build does not know.
@@ -98,10 +122,10 @@ pub enum Reject {
     WrongFragment,
     /// Authentication failed: wrong key or modified bytes.
     Decrypt,
-    /// Well-formed, but uses something this build or v0 cannot evaluate: an
-    /// unknown format, hash, AEAD or signature algorithm, a batch (kind 2),
-    /// a key-log entry other than a genesis, or a signature by a key the
-    /// author's log does not hold.
+    /// Well-formed, but not something a v0 replica handles: an unknown
+    /// sealed format or AEAD, a batch (kind 2), a key-log entry other than a
+    /// genesis or one this build cannot check, or an unverifiable copy of an
+    /// op at a position that is already settled.
     Unsupported,
     /// The signed op failed verification.
     Op(InvalidReason),
@@ -114,6 +138,12 @@ pub enum Reject {
     /// A different op by the same author at the same `seq` was applied first.
     /// See [`Replica::equivocations`].
     Equivocation,
+    /// The op's HLC is more than `max_clock_ahead_ms` ahead of the local
+    /// clock: the author's clock (or this device's) is wrong. See
+    /// [`AuthorStatus::clock_lead_ms`].
+    ClockTooFarAhead,
+    /// The genesis of one author more than `max_authors`.
+    TooManyAuthors,
     /// The key-log entry was not accepted.
     KeyLog(KeyLogError),
 }
@@ -125,11 +155,15 @@ pub enum PendingReason {
     UnknownAuthor,
     /// The author's op at `seq - 1` has not been applied.
     MissingPrev,
-    /// An op named in `deps` has not been applied.
-    MissingDep,
-    /// The op's HLC is more than `max_drift_ms` ahead of the local clock. It
-    /// is applied by a later call once local time has caught up.
+    /// The op's HLC is more than `max_drift_ms` (and at most
+    /// `max_clock_ahead_ms`) ahead of the local clock. It is applied by a
+    /// later call once local time has caught up.
     ClockAhead,
+    /// The op uses a format, hash or signature algorithm this build does not
+    /// know, or is signed by a key the author's log does not hold. It is
+    /// kept (WIRE-V0 section 6) and checked again after a restore, so a
+    /// newer build can apply it.
+    Unverifiable,
 }
 
 /// What happened to the item handed to [`Replica::ingest`].
@@ -148,9 +182,9 @@ pub enum IngestStatus {
     Pending(PendingReason),
     /// Dropped.
     Rejected(Reject),
-    /// The op would have to wait, but pending storage is full. It was **not**
-    /// kept and the pull cursor was **not** advanced past it: stop, and pull
-    /// again from [`Replica::cursor`] later.
+    /// The op would have to wait, but pending storage (the author's share or
+    /// all of it) is full, so it was dropped. The pull cursor moves on all
+    /// the same; [`Replica::needs_resync`] is now `true`. Keep ingesting.
     PendingFull,
 }
 
@@ -190,7 +224,7 @@ pub struct Equivocation {
 pub struct Stats {
     /// Remote ops applied.
     pub applied: u64,
-    /// Local commits made.
+    /// Local commits made (ops re-issued by `reset_identity` included).
     pub local: u64,
     /// Ops currently pending.
     pub pending: usize,
@@ -208,12 +242,51 @@ pub struct Stats {
     pub equivocations: u64,
     /// Items seen again.
     pub duplicates: u64,
-    /// Items refused because pending storage was full.
+    /// Ops dropped because pending storage was full (the incoming one, or an
+    /// older one evicted for it).
     pub refused: u64,
+    /// Ops rejected as [`Reject::ClockTooFarAhead`].
+    pub clock_rejected: u64,
+    /// Key logs rejected as [`Reject::TooManyAuthors`].
+    pub authors_refused: u64,
+    /// Times the relay was seen to have lost its log
+    /// ([`Replica::observe_relay_head`]).
+    pub relay_resets: u64,
     /// Authors whose key log is known, this device included.
     pub authors: usize,
     /// Sealed items waiting in the outbox.
     pub outbox: usize,
+    /// Acknowledged items not yet seen echoed back by the relay.
+    pub unechoed: usize,
+    /// [`Replica::needs_resync`].
+    pub needs_resync: bool,
+    /// [`Replica::forked`].
+    pub forked: bool,
+}
+
+/// What a replica knows about one author (one device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorStatus {
+    /// The author id.
+    pub author: Multihash,
+    /// `true` for this device's current identity.
+    pub own: bool,
+    /// `seq` of the author's latest applied op (0: none yet).
+    pub applied_seq: u64,
+    /// Ops of this author currently pending.
+    pub pending: usize,
+    /// An op of this author was dropped because pending storage was full:
+    /// later ops of the author cannot apply until a resync fetches it again.
+    pub gap: bool,
+    /// By how many milliseconds the HLC of the author's most recently
+    /// evaluated op led this device's clock, if that was more than
+    /// `max_drift_ms` (the op was held or rejected); `0` once an op of the
+    /// author applies. Non-zero for long, or beyond `max_clock_ahead_ms`,
+    /// means that device's clock (or this one's) is wrong.
+    pub clock_lead_ms: u64,
+    /// The author signed two different ops at one `seq`. Replicas may hold
+    /// different halves, and then disagree about this author's later ops.
+    pub equivocated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -226,6 +299,9 @@ struct Counters {
     equivocations: u64,
     duplicates: u64,
     refused: u64,
+    clock_rejected: u64,
+    authors_refused: u64,
+    relay_resets: u64,
 }
 
 struct Author {
@@ -235,12 +311,33 @@ struct Author {
     /// HLC and signed bytes of the op at `ops.last()`.
     head_hlc: Hlc,
     head_bytes: Vec<u8>,
+    gap: bool,
+    clock_lead_ms: u64,
+    equivocated: bool,
+}
+
+impl Author {
+    fn new(log: KeyLog) -> Author {
+        Author {
+            log,
+            ops: Vec::new(),
+            head_hlc: Hlc::default(),
+            head_bytes: Vec::new(),
+            gap: false,
+            clock_lead_ms: 0,
+            equivocated: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Blocker {
+    /// The key log of this author.
     Author(OpKey),
-    Op(OpKey),
+    /// This author's chain reaching `seq - 1` (or passing `seq`).
+    Seq(OpKey, u64),
+    /// Nothing that can happen while this build runs.
+    Opaque,
 }
 
 struct Pending {
@@ -252,11 +349,17 @@ struct Pending {
     hash: [u8; 32],
     /// Signatures already checked against the author's key log.
     verified: bool,
+    /// The author the op claims (`None` if it cannot be read), for the
+    /// per-author bound.
+    bucket: Option<OpKey>,
+    /// The `seq` the op claims (`u64::MAX` if it cannot be read).
+    seq: u64,
 }
 
 struct Ready {
     id: OpKey,
     author: OpKey,
+    seq: u64,
     hlc: Hlc,
     changes: Vec<Change>,
 }
@@ -264,10 +367,32 @@ struct Ready {
 enum Eval {
     Apply(Ready),
     Wait(Blocker, PendingReason),
-    Later(u64),
+    /// Held for the clock; `lead` is how far ahead it is.
+    Later {
+        wall_ms: u64,
+        lead: u64,
+    },
     Duplicate,
-    Equivocation { author: OpKey, seq: u64 },
+    Equivocation {
+        author: OpKey,
+        seq: u64,
+    },
+    /// A validly signed op of this device's own identity that conflicts with
+    /// the chain this replica recorded.
+    SelfFork,
+    ClockReject {
+        author: OpKey,
+        lead: u64,
+    },
     Drop(Reject),
+}
+
+struct Outcome {
+    eval: Eval,
+    bucket: Option<OpKey>,
+    seq: u64,
+    /// A validly signed op of this device's own identity beyond its head.
+    own_ahead: bool,
 }
 
 enum Step {
@@ -292,11 +417,11 @@ pub struct Replica {
     me: OpKey,
     clock: Hlc,
     cursor: u64,
-    /// Lowest relay position refused for lack of pending space; the cursor
-    /// stays below it. Not persisted.
-    hold: Option<u64>,
+    forked: bool,
+    /// An op was dropped for lack of pending space and its author is not one
+    /// with a key log (which carry their own flag).
+    gap_other: bool,
     authors: BTreeMap<OpKey, Author>,
-    applied: BTreeSet<OpKey>,
     merge: Merge,
     pending: BTreeMap<u64, Pending>,
     pending_hashes: BTreeSet<[u8; 32]>,
@@ -309,6 +434,9 @@ pub struct Replica {
     /// call that carries a clock.
     recheck: BTreeSet<u64>,
     outbox: VecDeque<Vec<u8>>,
+    /// Acknowledged items the relay has not echoed back yet, with the BLAKE3
+    /// of each.
+    unechoed: VecDeque<([u8; 32], Vec<u8>)>,
     counters: Counters,
     equivocations: Vec<Equivocation>,
 }
@@ -335,48 +463,63 @@ fn hlc_from(v: &Value) -> Option<Hlc> {
     })
 }
 
+/// A device identity: the signing key, its genesis key-log entry and the
+/// author id that entry defines.
+struct Identity {
+    signer: SigningKey,
+    log: KeyLog,
+    key: OpKey,
+}
+
+fn identity(fragment_id: &[u8], seed: &[u8; 32]) -> Result<Identity, Error> {
+    let signer = SigningKey::from_seed(SigAlg::Ed25519, seed);
+    let genesis = KeyLogEntry {
+        hash_alg: HashAlg::Blake3_256.id(),
+        prev: None,
+        action: KeyLogAction::Genesis {
+            fragment_id: fragment_id.to_vec(),
+            keys: vec![signer.public()],
+            policy: vec![SigAlg::Ed25519.id()],
+        },
+    }
+    .sign(&[&signer])?;
+    let log = KeyLog::genesis(&genesis).map_err(|_| Error::State("genesis"))?;
+    let key = OpKey::from_multihash(log.author()).ok_or(Error::State("genesis"))?;
+    Ok(Identity { signer, log, key })
+}
+
+/// A signed and sealed op, not yet part of any state.
+struct Built {
+    id: OpKey,
+    hlc: Hlc,
+    signed: Vec<u8>,
+    sealed: Vec<u8>,
+    /// The changes exactly as every other replica will decode them.
+    changes: Vec<Change>,
+}
+
 impl Replica {
     /// A replica with this device's identity and nothing else.
     fn base(root: [u8; 32], device_seed: [u8; 32], config: Config) -> Result<Replica, Error> {
         let pairing = Pairing::from_root(root);
         let seed = Zeroizing::new(device_seed);
         let fragment_id = pairing.fragment_id();
-        let signer = SigningKey::from_seed(SigAlg::Ed25519, &seed);
-        let genesis = KeyLogEntry {
-            hash_alg: HashAlg::Blake3_256.id(),
-            prev: None,
-            action: KeyLogAction::Genesis {
-                fragment_id: fragment_id.to_vec(),
-                keys: vec![signer.public()],
-                policy: vec![SigAlg::Ed25519.id()],
-            },
-        }
-        .sign(&[&signer])?;
-        let log = KeyLog::genesis(&genesis).map_err(|_| Error::State("genesis"))?;
-        let me = OpKey::from_multihash(log.author()).ok_or(Error::State("genesis"))?;
+        let me = identity(&fragment_id, &seed)?;
         let mut authors = BTreeMap::new();
-        authors.insert(
-            me,
-            Author {
-                log,
-                ops: Vec::new(),
-                head_hlc: Hlc::default(),
-                head_bytes: Vec::new(),
-            },
-        );
+        authors.insert(me.key, Author::new(me.log));
         Ok(Replica {
             config,
             key: pairing.fragment_key(),
             pairing,
             seed,
             fragment_id,
-            signer,
-            me,
+            signer: me.signer,
+            me: me.key,
             clock: Hlc::default(),
             cursor: 0,
-            hold: None,
+            forked: false,
+            gap_other: false,
             authors,
-            applied: BTreeSet::new(),
             merge: Merge::default(),
             pending: BTreeMap::new(),
             pending_hashes: BTreeSet::new(),
@@ -386,9 +529,23 @@ impl Replica {
             timed: BTreeSet::new(),
             recheck: BTreeSet::new(),
             outbox: VecDeque::new(),
+            unechoed: VecDeque::new(),
             counters: Counters::default(),
             equivocations: Vec::new(),
         })
+    }
+
+    fn sealed_genesis(&self, author: &OpKey, nonce: [u8; 24]) -> Result<Vec<u8>, Error> {
+        let genesis = self
+            .authors
+            .get(author)
+            .and_then(|a| a.log.entries().first())
+            .ok_or(Error::State("genesis"))?
+            .clone();
+        Ok(
+            SealedOp::seal(&self.key, &self.fragment_id, nonce, &Plain::KeyLog(genesis))?
+                .to_bytes()?,
+        )
     }
 
     /// Create this device's replica of the fragment with root secret `root`.
@@ -408,19 +565,7 @@ impl Replica {
         config: Config,
     ) -> Result<Replica, Error> {
         let mut r = Replica::base(root, device_seed, config)?;
-        let genesis = r
-            .authors
-            .get(&r.me)
-            .and_then(|a| a.log.entries().first())
-            .ok_or(Error::State("genesis"))?
-            .clone();
-        let sealed = SealedOp::seal(
-            &r.key,
-            &r.fragment_id,
-            genesis_nonce,
-            &Plain::KeyLog(genesis),
-        )?
-        .to_bytes()?;
+        let sealed = r.sealed_genesis(&r.me, genesis_nonce)?;
         r.outbox.push_back(sealed);
         Ok(r)
     }
@@ -432,9 +577,11 @@ impl Replica {
         &self.fragment_id
     }
 
-    /// Bearer token for the relay.
-    pub fn relay_token(&self) -> Zeroizing<[u8; 32]> {
-        self.pairing.relay_token()
+    /// Bearer token for the relay at `relay_origin` (`scheme://host[:port]`,
+    /// see [`canonical_origin`](crate::canonical_origin)). Each relay gets a
+    /// different token.
+    pub fn relay_token(&self, relay_origin: &str) -> Result<Zeroizing<[u8; 32]>, OriginError> {
+        self.pairing.relay_token(relay_origin)
     }
 
     /// The pairing secret, to show to another device.
@@ -447,7 +594,237 @@ impl Replica {
         self.me.to_multihash()
     }
 
+    /// `true` once the replica has seen proof that this device's author
+    /// chain exists in a version it did not write: a validly signed op of its
+    /// own identity beyond its head, or at a position where it recorded a
+    /// different op.
+    ///
+    /// The cause is a state rollback (a restore from a backup, or state
+    /// saved separately from the push) or a second device running with a
+    /// copy of this one's seed. Either way, signing more ops as this author
+    /// would equivocate, and peers would reject them without anyone being
+    /// told. So [`local_commit`](Replica::local_commit) fails with
+    /// [`Error::Forked`] until [`reset_identity`](Replica::reset_identity)
+    /// gives the device a fresh author.
+    ///
+    /// Ingest keeps working while forked. The replica follows the version of
+    /// its old chain that the relay has (the one peers hold) and keeps the
+    /// ops it wrote on its own branch for `reset_identity` to re-issue.
+    pub fn forked(&self) -> bool {
+        self.forked
+    }
+
+    /// Give this device a new author identity ("rejoin as a new device"),
+    /// keeping the pairing, the merge state and everything known about other
+    /// authors.
+    ///
+    /// `new_device_seed` is 32 fresh random bytes; the old seed is forgotten.
+    /// `nonce` is 24 fresh random bytes; the nonces of the items this call
+    /// seals are derived from it (BLAKE3 `derive_key` with the item's
+    /// index), so it must never be used for anything else.
+    ///
+    /// Queued to the outbox: the new genesis key-log entry, then one new op
+    /// for every op of the old identity that this replica wrote, that peers
+    /// will not have accepted (it sits on the losing branch of the fork), and
+    /// whose sealed bytes are still at hand (in the outbox, or acknowledged
+    /// but not yet echoed back). Those ops carry the same changes under new
+    /// stamps, so what the device wrote between the rollback and its
+    /// detection reaches the other replicas after all.
+    ///
+    /// Returns effects for the engine, as [`ingest`](Replica::ingest) does:
+    /// re-issued changes are newer writes now, and can win where the
+    /// originals had lost. Clears [`forked`](Replica::forked).
+    ///
+    /// May be called on a replica that is not forked. On error nothing has
+    /// changed.
+    pub fn reset_identity(
+        &mut self,
+        new_device_seed: [u8; 32],
+        nonce: [u8; 24],
+    ) -> Result<Vec<Change>, Error> {
+        let seed = Zeroizing::new(new_device_seed);
+        let new = identity(&self.fragment_id, &seed)?;
+        if self.authors.contains_key(&new.key) {
+            return Err(Error::State("device seed already in use"));
+        }
+        let nonce = Zeroizing::new(nonce);
+        let nonce_at = |i: u64| -> [u8; 24] {
+            let mut material = Zeroizing::new([0u8; 32]);
+            for (o, b) in material
+                .iter_mut()
+                .zip(nonce.iter().chain(&i.to_le_bytes()))
+            {
+                *o = *b;
+            }
+            let mut full = blake3::derive_key(CTX_RESET_NONCE, &*material);
+            let mut out = [0u8; 24];
+            for (o, b) in out.iter_mut().zip(full.iter()) {
+                *o = *b;
+            }
+            full.zeroize();
+            out
+        };
+
+        // Ops of the old identity that are not on the chain peers follow.
+        let old = self.authors.get(&self.me).ok_or(Error::State("author"))?;
+        let mut orphans: Vec<([u8; 32], Vec<Change>)> = Vec::new();
+        let retained = self
+            .unechoed
+            .iter()
+            .map(|(h, b)| (*h, b))
+            .chain(self.outbox.iter().map(|b| (*blake3::hash(b).as_bytes(), b)));
+        for (hash, sealed) in retained {
+            let Some(op) = self.open_own_op(sealed) else {
+                continue;
+            };
+            let on_chain = usize::try_from(op.body().seq)
+                .ok()
+                .and_then(|s| s.checked_sub(1))
+                .and_then(|i| old.ops.get(i))
+                .is_some_and(|k| Some(*k) == OpKey::from_multihash(op.id()));
+            if on_chain {
+                continue;
+            }
+            if let Ok(changes) = decode_payload(&op.body().payload) {
+                orphans.push((hash, changes));
+            }
+        }
+
+        // Build everything before touching the state.
+        let genesis = new.log.entries().first().ok_or(Error::State("genesis"))?;
+        let sealed_genesis = SealedOp::seal(
+            &self.key,
+            &self.fragment_id,
+            nonce_at(0),
+            &Plain::KeyLog(genesis.clone()),
+        )?
+        .to_bytes()?;
+        let mut built: Vec<Built> = Vec::new();
+        let mut hlc = self.clock;
+        let deps = self.dep_heads(&new.key);
+        for (i, (_, changes)) in orphans.iter().enumerate() {
+            // No wall clock here: the next HLC after everything seen.
+            hlc = hlc.tick(0);
+            let op = self.build_op(
+                &new.signer,
+                new.key,
+                i as u64 + 1,
+                built.last().map(|b| b.id),
+                hlc,
+                &deps,
+                encode_payload(changes)?,
+                nonce_at(i as u64 + 1),
+            )?;
+            built.push(op);
+        }
+
+        // Nothing below can fail.
+        let reissued: BTreeSet<[u8; 32]> = orphans.iter().map(|(h, _)| *h).collect();
+        self.unechoed.retain(|(h, _)| !reissued.contains(h));
+        self.outbox
+            .retain(|b| !reissued.contains(blake3::hash(b).as_bytes()));
+        self.seed = seed;
+        self.signer = new.signer;
+        self.me = new.key;
+        self.forked = false;
+        self.authors.insert(new.key, Author::new(new.log));
+        self.outbox.push_back(sealed_genesis);
+        let mut effects = Vec::new();
+        for op in built {
+            effects.extend(self.merge.apply(
+                &op.changes,
+                Stamp {
+                    hlc: op.hlc,
+                    id: op.id,
+                },
+                false,
+            ));
+            self.record_own(op);
+        }
+        Ok(effects)
+    }
+
+    /// Open one of this replica's sealed items; `Some` if it is an op of the
+    /// current identity.
+    fn open_own_op(&self, sealed: &[u8]) -> Option<Op> {
+        let item = SealedOp::from_bytes(sealed).ok()?;
+        let Plain::Op(signed) = item.open(&self.key, &self.fragment_id).ok()? else {
+            return None;
+        };
+        let op = Op::from_bytes(&signed).ok()?;
+        (OpKey::from_multihash(&op.body().author) == Some(self.me)).then_some(op)
+    }
+
     // ------------------------------------------------------------ local writes
+
+    /// Heads of every author but `me`; if there are too many, the most
+    /// recent.
+    fn dep_heads(&self, me: &OpKey) -> Vec<Multihash> {
+        let mut heads: Vec<(Hlc, OpKey)> = self
+            .authors
+            .iter()
+            .filter(|(k, _)| *k != me)
+            .filter_map(|(_, a)| a.ops.last().map(|id| (a.head_hlc, *id)))
+            .collect();
+        heads.sort_unstable_by(|a, b| b.cmp(a));
+        heads.truncate(MAX_DEPS);
+        heads.iter().map(|(_, id)| id.to_multihash()).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_op(
+        &self,
+        signer: &SigningKey,
+        author: OpKey,
+        seq: u64,
+        prev: Option<OpKey>,
+        hlc: Hlc,
+        deps: &[Multihash],
+        payload: Value,
+        nonce: [u8; 24],
+    ) -> Result<Built, Error> {
+        let body = OpBody {
+            hash_alg: HashAlg::Blake3_256.id(),
+            fragment_id: self.fragment_id.to_vec(),
+            author: author.to_multihash(),
+            seq,
+            prev: prev.map(OpKey::to_multihash),
+            hlc,
+            deps: deps.to_vec(),
+            payload,
+        };
+        let op = Op::sign(&body, &[signer])?;
+        let signed = op.to_bytes()?;
+        let sealed = SealedOp::seal(
+            &self.key,
+            &self.fragment_id,
+            nonce,
+            &Plain::Op(signed.clone()),
+        )?
+        .to_bytes()?;
+        if sealed.len() > MAX_SEALED_BYTES {
+            return Err(Error::TooLarge);
+        }
+        Ok(Built {
+            id: OpKey::from_multihash(op.id()).ok_or(Error::State("op id"))?,
+            hlc,
+            changes: decode_payload(&op.body().payload)?,
+            signed,
+            sealed,
+        })
+    }
+
+    /// Book an op of this device that the merge state already holds.
+    fn record_own(&mut self, op: Built) {
+        self.clock = op.hlc;
+        if let Some(me) = self.authors.get_mut(&self.me) {
+            me.ops.push(op.id);
+            me.head_hlc = op.hlc;
+            me.head_bytes = op.signed;
+        }
+        self.outbox.push_back(op.sealed);
+        self.counters.local += 1;
+    }
 
     /// Record a local commit: validate `changes`, stamp them with the next
     /// HLC, merge them, sign one op and queue it sealed in the outbox.
@@ -471,7 +848,7 @@ impl Replica {
     ///   the real one;
     /// - a `NodeDel` of a node that still has visible edges: `EdgeDel` for
     ///   each of them (already gone in an engine that cascades; deletes are
-    ///   idempotent).
+    ///   idempotent);
     /// - a `NodePut` that creates the last missing endpoint of an edge the
     ///   replica holds but could not show yet: an `EdgePut` for that edge.
     ///
@@ -479,62 +856,48 @@ impl Replica {
     /// creates the entity if needed and writes what it carries, a delete
     /// removes the entity and nothing else.
     ///
+    /// # Errors
+    ///
+    /// [`Error::Forked`] if the device's author chain has forked (see
+    /// [`forked`](Replica::forked)); the payload errors of SYNC-V0 section 4.
     /// On error nothing has changed and nothing was queued.
+    ///
+    /// `now_ms` is taken as given. A wrong local clock cannot be told from a
+    /// long time offline by anything the replica knows, so it is not checked
+    /// here; an op stamped far in the future is held or rejected by the
+    /// *other* replicas, which report it in [`AuthorStatus::clock_lead_ms`].
     pub fn local_commit(
         &mut self,
         changes: &[Change],
         now_ms: u64,
         nonce: [u8; 24],
     ) -> Result<Vec<Change>, Error> {
+        if self.forked {
+            return Err(Error::Forked);
+        }
         let payload = encode_payload(changes)?;
         let hlc = self.clock.tick(now_ms);
         let me = self.authors.get(&self.me).ok_or(Error::State("author"))?;
-        // Heads of the other authors; if there are too many, the most recent.
-        let mut heads: Vec<(Hlc, OpKey)> = self
-            .authors
-            .iter()
-            .filter(|(k, _)| **k != self.me)
-            .filter_map(|(_, a)| a.ops.last().map(|id| (a.head_hlc, *id)))
-            .collect();
-        heads.sort_unstable_by(|a, b| b.cmp(a));
-        heads.truncate(MAX_DEPS);
-        let body = OpBody {
-            hash_alg: HashAlg::Blake3_256.id(),
-            fragment_id: self.fragment_id.to_vec(),
-            author: self.me.to_multihash(),
-            seq: me.ops.len() as u64 + 1,
-            prev: me.ops.last().map(|k| k.to_multihash()),
+        let op = self.build_op(
+            &self.signer,
+            self.me,
+            me.ops.len() as u64 + 1,
+            me.ops.last().copied(),
             hlc,
-            deps: heads.iter().map(|(_, id)| id.to_multihash()).collect(),
+            &self.dep_heads(&self.me),
             payload,
-        };
-        let op = Op::sign(&body, &[&self.signer])?;
-        let signed = op.to_bytes()?;
-        let sealed = SealedOp::seal(
-            &self.key,
-            &self.fragment_id,
             nonce,
-            &Plain::Op(signed.clone()),
-        )?
-        .to_bytes()?;
-        if sealed.len() > MAX_SEALED_BYTES {
-            return Err(Error::TooLarge);
-        }
-        let id = OpKey::from_multihash(op.id()).ok_or(Error::State("op id"))?;
-        // The changes exactly as every other replica will decode them.
-        let canonical = decode_payload(&op.body().payload)?;
-
+        )?;
         // Nothing below can fail.
-        let effects = self.merge.apply(&canonical, Stamp { hlc, id }, true);
-        self.clock = hlc;
-        if let Some(me) = self.authors.get_mut(&self.me) {
-            me.ops.push(id);
-            me.head_hlc = hlc;
-            me.head_bytes = signed;
-        }
-        self.applied.insert(id);
-        self.outbox.push_back(sealed);
-        self.counters.local += 1;
+        let effects = self.merge.apply(
+            &op.changes,
+            Stamp {
+                hlc: op.hlc,
+                id: op.id,
+            },
+            true,
+        );
+        self.record_own(op);
         Ok(effects)
     }
 
@@ -543,9 +906,10 @@ impl Replica {
     /// Take one sealed item received from a relay or a peer.
     ///
     /// `relay_seq` is the position the relay gave the item (`0` if it did not
-    /// come from the relay this replica's cursor belongs to); the pull cursor
-    /// moves up to it unless the status is [`IngestStatus::PendingFull`].
-    /// `now_ms` is the local clock in Unix milliseconds.
+    /// come from the relay this replica's cursor belongs to). The pull cursor
+    /// moves up to it whatever happens to the item: a replica never asks for
+    /// the same item again because it could not use it. `now_ms` is the
+    /// local clock in Unix milliseconds.
     ///
     /// Never fails and never panics, whatever the bytes are: the outcome says
     /// what happened and carries the effects for the engine.
@@ -553,20 +917,7 @@ impl Replica {
         let mut effects = Vec::new();
         let mut applied = self.drain_due(now_ms, &mut effects);
         let status = self.ingest_item(sealed, now_ms, &mut effects, &mut applied);
-        if status == IngestStatus::PendingFull {
-            self.counters.refused += 1;
-        }
-        if relay_seq != 0 {
-            if status == IngestStatus::PendingFull {
-                self.hold = Some(self.hold.map_or(relay_seq, |h| h.min(relay_seq)));
-            } else {
-                if self.hold == Some(relay_seq) {
-                    self.hold = None;
-                }
-                let limit = self.hold.map_or(u64::MAX, |h| h.saturating_sub(1));
-                self.cursor = self.cursor.max(relay_seq.min(limit));
-            }
-        }
+        self.cursor = self.cursor.max(relay_seq);
         IngestOutcome {
             status,
             applied,
@@ -592,6 +943,8 @@ impl Replica {
             }
             Reject::Unsupported => self.counters.unsupported += 1,
             Reject::Equivocation => self.counters.equivocations += 1,
+            Reject::ClockTooFarAhead => self.counters.clock_rejected += 1,
+            Reject::TooManyAuthors => self.counters.authors_refused += 1,
             Reject::WrongFragment
             | Reject::Op(_)
             | Reject::Payload(_)
@@ -616,6 +969,17 @@ impl Replica {
     ) -> IngestStatus {
         if sealed.len() > MAX_SEALED_BYTES {
             return self.reject(Reject::TooLarge);
+        }
+        // One of our own items coming back: the relay has it.
+        if !self.unechoed.is_empty() {
+            let hash = *blake3::hash(sealed).as_bytes();
+            if let Some(i) = self.unechoed.iter().position(|(h, _)| *h == hash) {
+                // While forked they are kept: `reset_identity` needs them.
+                if !self.forked {
+                    self.unechoed.remove(i);
+                }
+                return self.duplicate();
+            }
         }
         let item = match SealedOp::from_bytes(sealed) {
             Ok(s) => s,
@@ -669,15 +1033,10 @@ impl Replica {
         if self.authors.contains_key(&author) {
             return self.duplicate();
         }
-        self.authors.insert(
-            author,
-            Author {
-                log,
-                ops: Vec::new(),
-                head_hlc: Hlc::default(),
-                head_bytes: Vec::new(),
-            },
-        );
+        if self.authors.len() >= self.config.max_authors {
+            return self.reject(Reject::TooManyAuthors);
+        }
+        self.authors.insert(author, Author::new(log));
         let work = self
             .waiting
             .remove(&Blocker::Author(author))
@@ -707,6 +1066,8 @@ impl Replica {
                 bytes: signed,
                 hash,
                 verified: false,
+                bucket: None,
+                seq: u64::MAX,
             },
         );
         let mut work = BTreeSet::new();
@@ -719,16 +1080,59 @@ impl Replica {
             Step::Duplicate => IngestStatus::Duplicate,
             Step::Dropped(r) => IngestStatus::Rejected(r),
             Step::Waiting(why) => {
-                if self.pending.len() > self.config.max_pending_items
-                    || self.pending_bytes > self.config.max_pending_bytes
-                {
-                    self.unregister(order);
-                    self.forget(order);
-                    IngestStatus::PendingFull
-                } else {
+                if self.make_room(order) {
                     IngestStatus::Pending(why)
+                } else {
+                    IngestStatus::PendingFull
                 }
             }
+        }
+    }
+
+    /// Enforce the pending bounds after `order` was added. Returns whether
+    /// `order` is still held.
+    ///
+    /// An author over its share loses its op with the highest `seq` (the one
+    /// furthest from being applicable), which may be the new one. When the
+    /// store as a whole is full the new op goes. Either way the author is
+    /// marked as having a gap.
+    fn make_room(&mut self, order: u64) -> bool {
+        let Some((bucket, seq)) = self.pending.get(&order).map(|p| (p.bucket, p.seq)) else {
+            return false;
+        };
+        let (mut items, mut size) = (0usize, 0usize);
+        let mut last = (seq, order);
+        for (o, p) in &self.pending {
+            if p.bucket == bucket {
+                items += 1;
+                size += p.bytes.len();
+                last = last.max((p.seq, *o));
+            }
+        }
+        let mut kept = true;
+        if items > self.config.max_pending_items_per_author
+            || size > self.config.max_pending_bytes_per_author
+        {
+            self.evict(last.1, bucket);
+            kept = last.1 != order;
+        }
+        if kept
+            && (self.pending.len() > self.config.max_pending_items
+                || self.pending_bytes > self.config.max_pending_bytes)
+        {
+            self.evict(order, bucket);
+            kept = false;
+        }
+        kept
+    }
+
+    fn evict(&mut self, order: u64, bucket: Option<OpKey>) {
+        self.unregister(order);
+        self.forget(order);
+        self.counters.refused += 1;
+        match bucket.and_then(|k| self.authors.get_mut(&k)) {
+            Some(a) => a.gap = true,
+            None => self.gap_other = true,
         }
     }
 
@@ -788,17 +1192,41 @@ impl Replica {
             return Step::Duplicate;
         };
         let mut verified = item.verified;
-        let eval = self.evaluate(&item.bytes, &mut verified, now_ms);
+        let mut out = self.evaluate(&item.bytes, &mut verified, now_ms, false);
+        if out.own_ahead || matches!(out.eval, Eval::SelfFork) {
+            self.forked = true;
+        }
+        if let Eval::SelfFork = out.eval {
+            // Follow the version of our old chain that the relay has, if
+            // this op continues the part both versions share. What we wrote
+            // on our own branch stays merged; `reset_identity` re-issues it.
+            let adopt = self.evaluate(&item.bytes, &mut verified, now_ms, true);
+            out.eval = match adopt.eval {
+                Eval::Apply(ready) => {
+                    if let Some(me) = self.authors.get_mut(&ready.author) {
+                        me.ops
+                            .truncate(usize::try_from(ready.seq - 1).unwrap_or(usize::MAX));
+                    }
+                    Eval::Apply(ready)
+                }
+                _ => Eval::Drop(Reject::Equivocation),
+            };
+        }
         if let Some(item) = self.pending.get_mut(&order) {
             item.verified = verified;
+            item.bucket = out.bucket;
+            item.seq = out.seq;
         }
-        match eval {
+        match out.eval {
             Eval::Wait(blocker, why) => {
                 self.waiting.entry(blocker).or_default().push(order);
                 Step::Waiting(why)
             }
-            Eval::Later(wall_ms) => {
+            Eval::Later { wall_ms, lead } => {
                 self.timed.insert((wall_ms, order));
+                if let Some(a) = out.bucket.and_then(|k| self.authors.get_mut(&k)) {
+                    a.clock_lead_ms = lead;
+                }
                 Step::Waiting(PendingReason::ClockAhead)
             }
             Eval::Duplicate => {
@@ -811,6 +1239,14 @@ impl Replica {
                 self.reject(r.clone());
                 Step::Dropped(r)
             }
+            Eval::ClockReject { author, lead } => {
+                self.forget(order);
+                if let Some(a) = self.authors.get_mut(&author) {
+                    a.clock_lead_ms = lead;
+                }
+                self.reject(Reject::ClockTooFarAhead);
+                Step::Dropped(Reject::ClockTooFarAhead)
+            }
             Eval::Equivocation { author, seq } => {
                 if let Some(item) = self.forget(order) {
                     self.record_equivocation(author, seq, item.bytes);
@@ -818,6 +1254,8 @@ impl Replica {
                 self.reject(Reject::Equivocation);
                 Step::Dropped(Reject::Equivocation)
             }
+            // Resolved above.
+            Eval::SelfFork => Step::Duplicate,
             Eval::Apply(ready) => {
                 let Some(item) = self.forget(order) else {
                     return Step::Duplicate;
@@ -841,11 +1279,15 @@ impl Replica {
                     a.ops.push(ready.id);
                     a.head_hlc = ready.hlc;
                     a.head_bytes = item.bytes;
+                    a.clock_lead_ms = 0;
                 }
-                self.applied.insert(ready.id);
                 self.counters.applied += 1;
-                if let Some(woken) = self.waiting.remove(&Blocker::Op(ready.id)) {
-                    work.extend(woken);
+                // The next op of the author, and any other copies or rivals
+                // held for this position.
+                for seq in [ready.seq, ready.seq.saturating_add(1)] {
+                    if let Some(woken) = self.waiting.remove(&Blocker::Seq(ready.author, seq)) {
+                        work.extend(woken);
+                    }
                 }
                 Step::Applied
             }
@@ -853,54 +1295,114 @@ impl Replica {
     }
 
     /// Decide what to do with a signed op. Pure: no state changes.
-    fn evaluate(&self, signed: &[u8], verified: &mut bool, now_ms: u64) -> Eval {
+    ///
+    /// An op is applicable when its author's key log is known and the
+    /// author's previous op is applied. `deps` are not consulted: merge is a
+    /// function of the set of ops, so nothing an op of *another* author does
+    /// or fails to do can be a reason to withhold this one.
+    ///
+    /// With `adopt_own`, an op of this device's identity at or below its
+    /// head is judged as if the head were just before it (see `step`).
+    fn evaluate(
+        &self,
+        signed: &[u8],
+        verified: &mut bool,
+        now_ms: u64,
+        adopt_own: bool,
+    ) -> Outcome {
+        let mut out = Outcome {
+            eval: Eval::Duplicate,
+            bucket: None,
+            seq: u64::MAX,
+            own_ahead: false,
+        };
+        let unverifiable = Eval::Wait(Blocker::Opaque, PendingReason::Unverifiable);
         let op = match Op::from_bytes(signed) {
             Ok(op) => op,
+            // A newer format or hash: keep the bytes for a newer build.
             Err(DecodeError::UnsupportedFormat(_) | DecodeError::UnsupportedKind(_)) => {
-                return Eval::Drop(Reject::Unsupported);
+                out.eval = unverifiable;
+                return out;
             }
-            Err(e) => return Eval::Drop(Reject::Op(InvalidReason::Malformed(e))),
+            Err(e) => {
+                out.eval = Eval::Drop(Reject::Op(InvalidReason::Malformed(e)));
+                return out;
+            }
         };
         let body = op.body();
-        if body.fragment_id != self.fragment_id {
-            return Eval::Drop(Reject::WrongFragment);
-        }
-        let (Some(id), Some(author_key)) = (
-            OpKey::from_multihash(op.id()),
-            OpKey::from_multihash(&body.author),
-        ) else {
-            return Eval::Drop(Reject::Unsupported);
-        };
-        if self.applied.contains(&id) {
-            return Eval::Duplicate;
-        }
-        let Some(author) = self.authors.get(&author_key) else {
-            return Eval::Wait(Blocker::Author(author_key), PendingReason::UnknownAuthor);
-        };
-        if !*verified {
-            // The drift check is done below, where it can hold the op back.
-            match verify(signed, &VerifyCtx::new(&self.fragment_id, &author.log)) {
-                Verdict::Valid(_) => *verified = true,
-                Verdict::Unverifiable { .. } => return Eval::Drop(Reject::Unsupported),
-                Verdict::Invalid { reason } => return Eval::Drop(Reject::Op(reason)),
+        out.eval = (|| {
+            if body.fragment_id != self.fragment_id {
+                return Eval::Drop(Reject::WrongFragment);
             }
-        }
-        let head = author.ops.len() as u64;
-        if body.seq <= head {
-            // Every position up to `head` holds an applied op, and this is
-            // not it: two validly signed ops at one `(author, seq)`.
-            return Eval::Equivocation {
-                author: author_key,
-                seq: body.seq,
+            let (Some(id), Some(author_key)) = (
+                OpKey::from_multihash(op.id()),
+                OpKey::from_multihash(&body.author),
+            ) else {
+                return unverifiable;
             };
-        }
-        let changes = match decode_payload(&body.payload) {
-            Ok(c) => c,
-            Err(e) => return Eval::Drop(Reject::Payload(e)),
-        };
-        if body.seq == head + 1 {
+            out.bucket = Some(author_key);
+            out.seq = body.seq;
+            let seq = body.seq;
+            let Some(author) = self.authors.get(&author_key) else {
+                return Eval::Wait(Blocker::Author(author_key), PendingReason::UnknownAuthor);
+            };
+            let recorded = usize::try_from(seq)
+                .ok()
+                .and_then(|s| s.checked_sub(1))
+                .and_then(|i| author.ops.get(i));
+            if recorded == Some(&id) {
+                return Eval::Duplicate;
+            }
+            let own = author_key == self.me;
+            let head = if adopt_own && own && recorded.is_some() {
+                seq - 1
+            } else {
+                author.ops.len() as u64
+            };
+            if !*verified {
+                // The drift check is done below, where it can hold the op.
+                match verify(signed, &VerifyCtx::new(&self.fragment_id, &author.log)) {
+                    Verdict::Valid(_) => *verified = true,
+                    // A position that is already settled needs no further
+                    // copies; anything else is kept for a newer build.
+                    Verdict::Unverifiable { .. } if seq <= head => {
+                        return Eval::Drop(Reject::Unsupported);
+                    }
+                    Verdict::Unverifiable { .. } => {
+                        return Eval::Wait(
+                            Blocker::Seq(author_key, seq),
+                            PendingReason::Unverifiable,
+                        );
+                    }
+                    Verdict::Invalid { reason } => return Eval::Drop(Reject::Op(reason)),
+                }
+            }
+            if seq <= head {
+                // Every position up to `head` holds an applied op, and this
+                // is not it: two validly signed ops at one `(author, seq)`.
+                return if own {
+                    Eval::SelfFork
+                } else {
+                    Eval::Equivocation {
+                        author: author_key,
+                        seq,
+                    }
+                };
+            }
+            out.own_ahead = own;
+            let changes = match decode_payload(&body.payload) {
+                Ok(c) => c,
+                Err(e) => return Eval::Drop(Reject::Payload(e)),
+            };
+            if seq != head + 1 {
+                return Eval::Wait(Blocker::Seq(author_key, seq), PendingReason::MissingPrev);
+            }
+            let before = usize::try_from(head)
+                .ok()
+                .and_then(|h| h.checked_sub(1))
+                .and_then(|i| author.ops.get(i));
             let prev = body.prev.as_ref().map(OpKey::from_multihash);
-            let linked = match (prev, author.ops.last()) {
+            let linked = match (prev, before) {
                 (None, None) => true,
                 (Some(Some(p)), Some(last)) => p == *last,
                 _ => false,
@@ -908,49 +1410,45 @@ impl Replica {
             if !linked {
                 return Eval::Drop(Reject::ChainFork);
             }
-            if head > 0 && body.hlc <= author.head_hlc {
+            // (When adopting, the HLC of the op before is no longer at hand;
+            // the replicas that took this branch first checked it.)
+            if head > 0 && head == author.ops.len() as u64 && body.hlc <= author.head_hlc {
                 return Eval::Drop(Reject::HlcNotMonotonic);
             }
-        } else {
-            match body.prev.as_ref().map(OpKey::from_multihash) {
-                // Applied already, yet not this author's `seq - 1`: it never
-                // will be.
-                Some(Some(p)) if self.applied.contains(&p) => {
-                    return Eval::Drop(Reject::ChainFork);
-                }
-                Some(Some(p)) => return Eval::Wait(Blocker::Op(p), PendingReason::MissingPrev),
-                // An id this build cannot compute can never be applied here.
-                Some(None) => return Eval::Drop(Reject::Unsupported),
-                None => return Eval::Drop(Reject::ChainFork),
+            let lead = body.hlc.wall_ms.saturating_sub(now_ms);
+            if lead > self.config.max_clock_ahead_ms.max(self.config.max_drift_ms) {
+                return Eval::ClockReject {
+                    author: author_key,
+                    lead,
+                };
             }
-        }
-        for dep in &body.deps {
-            match OpKey::from_multihash(dep) {
-                Some(d) if self.applied.contains(&d) => {}
-                Some(d) => return Eval::Wait(Blocker::Op(d), PendingReason::MissingDep),
-                None => return Eval::Drop(Reject::Unsupported),
+            if lead > self.config.max_drift_ms {
+                return Eval::Later {
+                    wall_ms: body.hlc.wall_ms,
+                    lead,
+                };
             }
-        }
-        if body.hlc.wall_ms > now_ms.saturating_add(self.config.max_drift_ms) {
-            return Eval::Later(body.hlc.wall_ms);
-        }
-        Eval::Apply(Ready {
-            id,
-            author: author_key,
-            hlc: body.hlc,
-            changes,
-        })
+            Eval::Apply(Ready {
+                id,
+                author: author_key,
+                seq,
+                hlc: body.hlc,
+                changes,
+            })
+        })();
+        out
     }
 
     fn record_equivocation(&mut self, author: OpKey, seq: u64, rejected: Vec<u8>) {
+        let Some(a) = self.authors.get_mut(&author) else {
+            return;
+        };
+        a.equivocated = true;
         if self.equivocations.iter().any(|e| e.rejected == rejected)
             || self.equivocations.len() >= MAX_EQUIVOCATIONS
         {
             return;
         }
-        let Some(a) = self.authors.get(&author) else {
-            return;
-        };
         let Some(kept) = usize::try_from(seq)
             .ok()
             .and_then(|s| s.checked_sub(1))
@@ -990,11 +1488,24 @@ impl Replica {
         self.outbox.iter().take(max).map(Vec::as_slice).collect()
     }
 
-    /// Drop the first `count` outbox items after the relay acknowledged them.
-    /// Returns how many were removed.
+    /// Take the first `count` items out of the outbox after the relay
+    /// acknowledged them. Returns how many were taken.
+    ///
+    /// They are not forgotten yet: each is kept until the relay hands it
+    /// back in a pull (an echo, which [`ingest`](Replica::ingest) recognises
+    /// by its bytes), so that a relay that acknowledges and then loses its
+    /// log can be given them again (see
+    /// [`observe_relay_head`](Replica::observe_relay_head)). At most
+    /// `max_unechoed_items` are kept; beyond that the oldest go.
     pub fn outbox_ack(&mut self, count: usize) -> usize {
         let n = count.min(self.outbox.len());
-        self.outbox.drain(..n);
+        for item in self.outbox.drain(..n) {
+            self.unechoed
+                .push_back((*blake3::hash(&item).as_bytes(), item));
+        }
+        while self.unechoed.len() > self.config.max_unechoed_items {
+            self.unechoed.pop_front();
+        }
         n
     }
 
@@ -1003,18 +1514,59 @@ impl Replica {
         self.cursor
     }
 
-    /// Set the pull cursor, for example to `0` to replay a fragment from the
-    /// start (ingest is idempotent), or to a `Batch.next` that covers items
-    /// the transport chose not to hand over.
+    /// Set the pull cursor.
     pub fn set_cursor(&mut self, cursor: u64) {
         self.cursor = cursor;
-        self.hold = None;
     }
 
-    /// Discard every pending op and return how many there were. A way out
-    /// when pending storage is full of ops that will never be applicable;
-    /// follow it with `set_cursor(0)` so that the ones that are get fetched
-    /// again.
+    /// Tell the replica what the relay answered as `Batch.next` (the position
+    /// of the last item the relay holds at or after the cursor it was asked
+    /// about). Call it for every `Batch`, before or after ingesting its
+    /// items.
+    ///
+    /// A relay never has fewer items than it has handed out, unless it lost
+    /// its log and started numbering from 1 again. If `next` is below the
+    /// replica's cursor, that is what happened: the cursor goes back to 0 (so
+    /// that what other devices push to the new log is not skipped), every
+    /// acknowledged item that was never seen echoed is put back at the front
+    /// of the outbox, [`Stats::relay_resets`] is incremented and `true` is
+    /// returned.
+    ///
+    /// This recovers what was in flight. It does not recover history: what
+    /// only the relay held is gone (SYNC-V0 section 8).
+    pub fn observe_relay_head(&mut self, next: u64) -> bool {
+        if next >= self.cursor {
+            return false;
+        }
+        self.cursor = 0;
+        self.counters.relay_resets += 1;
+        while let Some((_, item)) = self.unechoed.pop_back() {
+            self.outbox.push_front(item);
+        }
+        true
+    }
+
+    /// `true` if an op was dropped because pending storage was full. The
+    /// dropped op, and with it every later op of its author, can only be had
+    /// by pulling again; replay is idempotent. The transport should call
+    /// [`start_resync`](Replica::start_resync) and pull from the start, not
+    /// at once but with a growing delay: if the reason the ops cannot apply
+    /// has not gone (see [`authors`](Replica::authors)), the flag comes back.
+    pub fn needs_resync(&self) -> bool {
+        self.gap_other || self.authors.values().any(|a| a.gap)
+    }
+
+    /// Begin a resync: the pull cursor goes to 0 and
+    /// [`needs_resync`](Replica::needs_resync) is cleared.
+    pub fn start_resync(&mut self) {
+        self.cursor = 0;
+        self.gap_other = false;
+        for a in self.authors.values_mut() {
+            a.gap = false;
+        }
+    }
+
+    /// Discard every pending op and return how many there were.
     pub fn clear_pending(&mut self) -> usize {
         let n = self.pending.len();
         self.pending.clear();
@@ -1078,9 +1630,36 @@ impl Replica {
             equivocations: c.equivocations,
             duplicates: c.duplicates,
             refused: c.refused,
+            clock_rejected: c.clock_rejected,
+            authors_refused: c.authors_refused,
+            relay_resets: c.relay_resets,
             authors: self.authors.len(),
             outbox: self.outbox.len(),
+            unechoed: self.unechoed.len(),
+            needs_resync: self.needs_resync(),
+            forked: self.forked,
         }
+    }
+
+    /// Every author whose key log is known, ordered by author id: how far
+    /// its chain has been applied and whether something is wrong with it.
+    pub fn authors(&self) -> Vec<AuthorStatus> {
+        self.authors
+            .iter()
+            .map(|(k, a)| AuthorStatus {
+                author: k.to_multihash(),
+                own: *k == self.me,
+                applied_seq: a.ops.len() as u64,
+                pending: self
+                    .pending
+                    .values()
+                    .filter(|p| p.bucket == Some(*k))
+                    .count(),
+                gap: a.gap,
+                clock_lead_ms: a.clock_lead_ms,
+                equivocated: a.equivocated,
+            })
+            .collect()
     }
 
     /// Equivocation records, oldest first (at most [`MAX_EQUIVOCATIONS`]).
@@ -1092,9 +1671,10 @@ impl Replica {
 
     /// The whole replica state as deterministic CBOR (SYNC-V0 section 7).
     ///
-    /// **The bytes contain the root secret and the device seed.** Store them
-    /// encrypted, and in the same atomic write as the engine's data. The
-    /// returned buffer is zeroized on drop.
+    /// **The bytes contain the root secret and the device seed**, and
+    /// [`from_bytes`](Replica::from_bytes) trusts them: store them under
+    /// *authenticated* encryption, and in the same atomic write as the
+    /// engine's data. The returned buffer is zeroized on drop.
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
         let opt_bytes = |b: &[u8]| {
             if b.is_empty() { Value::Null } else { bytes(b) }
@@ -1113,6 +1693,9 @@ impl Replica {
                         hlc_value(a.head_hlc)
                     },
                     opt_bytes(&a.head_bytes),
+                    Value::Bool(a.gap),
+                    uint(a.clock_lead_ms),
+                    Value::Bool(a.equivocated),
                 ])
             })
             .collect();
@@ -1141,10 +1724,12 @@ impl Replica {
             bytes(&*self.seed),
             hlc_value(self.clock),
             uint(self.cursor),
+            Value::Array(vec![Value::Bool(self.forked), Value::Bool(self.gap_other)]),
             Value::Array(authors),
             self.merge.to_value()?,
             Value::Array(self.pending.values().map(|p| bytes(&p.bytes)).collect()),
             Value::Array(self.outbox.iter().map(|o| bytes(o)).collect()),
+            Value::Array(self.unechoed.iter().map(|(_, o)| bytes(o)).collect()),
             Value::Array(
                 [
                     c.applied,
@@ -1155,6 +1740,9 @@ impl Replica {
                     c.equivocations,
                     c.duplicates,
                     c.refused,
+                    c.clock_rejected,
+                    c.authors_refused,
+                    c.relay_resets,
                 ]
                 .into_iter()
                 .map(uint)
@@ -1167,11 +1755,22 @@ impl Replica {
 
     /// Restore a replica from [`to_bytes`](Replica::to_bytes) output.
     ///
-    /// Strict: the bytes must be exactly what `to_bytes` produces for the
-    /// state they describe (the restored replica is re-encoded and compared),
-    /// every key log must verify, and the device's own identity must be among
-    /// them. Pending ops are re-evaluated by the next call that carries a
-    /// clock.
+    /// Strict about *form*: the bytes must be exactly what `to_bytes`
+    /// produces for the state they describe (the restored replica is
+    /// re-encoded and compared), every key log must verify, and the device's
+    /// own identity must be among them.
+    ///
+    /// **Not a check of integrity.** Bytes that were changed into another
+    /// well-formed state are accepted: a different cursor, a missing op in
+    /// an author's list, an altered pending or outbox item, other merge
+    /// stamps. Whoever can write the stored state can make the replica
+    /// believe anything, so the state must be kept under authenticated
+    /// encryption (an AEAD), not merely encrypted.
+    ///
+    /// Every pending op, including those held as
+    /// [`PendingReason::Unverifiable`], is evaluated afresh by the next call
+    /// that carries a clock, so a newer build gets to apply what an older
+    /// one could only keep.
     pub fn from_bytes(state: &[u8], config: Config) -> Result<Replica, Error> {
         const BAD: Error = Error::State("shape");
         let v = Zeroizing::new(StateValue(
@@ -1185,7 +1784,7 @@ impl Replica {
         if version != STATE_VERSION {
             return Err(Error::StateVersion(version));
         }
-        if f.remaining() != 10 {
+        if f.remaining() != 12 {
             return Err(BAD);
         }
         let root: Zeroizing<[u8; 32]> = Zeroizing::new(f.fixed().ok_or(BAD)?);
@@ -1193,10 +1792,14 @@ impl Replica {
         let mut r = Replica::base(*root, *seed, config)?;
         r.clock = f.value().and_then(hlc_from).ok_or(BAD)?;
         r.cursor = f.u64().ok_or(BAD)?;
+        let mut flags = Fields::exact(f.value().ok_or(BAD)?, 2).ok_or(BAD)?;
+        r.forked = flags.bool().ok_or(BAD)?;
+        r.gap_other = flags.bool().ok_or(BAD)?;
 
         let mut authors = BTreeMap::new();
+        let mut seen = BTreeSet::new();
         for a in f.array().ok_or(BAD)? {
-            let mut a = Fields::exact(a, 4).ok_or(BAD)?;
+            let mut a = Fields::exact(a, 7).ok_or(BAD)?;
             let log =
                 KeyLog::genesis(a.bytes().ok_or(BAD)?).map_err(|_| Error::State("key log"))?;
             if log.fragment_id() != r.fragment_id {
@@ -1206,7 +1809,7 @@ impl Replica {
             let mut ops = Vec::new();
             for id in a.array().ok_or(BAD)? {
                 let id = OpKey::from_value(id).ok_or(BAD)?;
-                if !r.applied.insert(id) {
+                if !seen.insert(id) {
                     return Err(Error::State("op listed twice"));
                 }
                 ops.push(id);
@@ -1232,6 +1835,9 @@ impl Replica {
                     ops,
                     head_hlc,
                     head_bytes,
+                    gap: a.bool().ok_or(BAD)?,
+                    clock_lead_ms: a.u64().ok_or(BAD)?,
+                    equivocated: a.bool().ok_or(BAD)?,
                 },
             );
         }
@@ -1260,6 +1866,8 @@ impl Replica {
                     bytes: b.clone(),
                     hash,
                     verified: false,
+                    bucket: None,
+                    seq: u64::MAX,
                 },
             );
             r.recheck.insert(r.next_order);
@@ -1271,7 +1879,14 @@ impl Replica {
             };
             r.outbox.push_back(b.clone());
         }
-        let mut c = Fields::exact(f.value().ok_or(BAD)?, 8).ok_or(BAD)?;
+        for o in f.array().ok_or(BAD)? {
+            let Value::Bytes(b) = o else {
+                return Err(BAD);
+            };
+            r.unechoed
+                .push_back((*blake3::hash(b).as_bytes(), b.clone()));
+        }
+        let mut c = Fields::exact(f.value().ok_or(BAD)?, 11).ok_or(BAD)?;
         let mut next = || c.u64().ok_or(BAD);
         r.counters = Counters {
             applied: next()?,
@@ -1282,6 +1897,9 @@ impl Replica {
             equivocations: next()?,
             duplicates: next()?,
             refused: next()?,
+            clock_rejected: next()?,
+            authors_refused: next()?,
+            relay_resets: next()?,
         };
         for e in f.array().ok_or(BAD)? {
             let mut e = Fields::exact(e, 5).ok_or(BAD)?;
@@ -1327,19 +1945,12 @@ struct StateValue(Value);
 
 impl Zeroize for StateValue {
     fn zeroize(&mut self) {
-        fn wipe(v: &mut Value) {
-            match v {
-                Value::Bytes(b) => b.zeroize(),
-                Value::Array(items) => items.iter_mut().for_each(wipe),
-                _ => {}
-            }
-        }
-        // The secrets are top-level fields; the merge state below them is not
-        // secret from whoever holds the fragment key, so one level is enough.
+        // The secrets are top-level byte strings; the merge state below them
+        // is not secret from whoever holds the fragment key.
         if let Value::Array(items) = &mut self.0 {
             for item in items.iter_mut() {
-                if let Value::Bytes(_) = item {
-                    wipe(item);
+                if let Value::Bytes(b) = item {
+                    b.zeroize();
                 }
             }
         }

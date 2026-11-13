@@ -913,6 +913,11 @@ async fn plaintext_marker_never_appears_in_what_the_relay_holds() {
             } else {
                 let bytes = std::fs::read(&path).unwrap();
                 assert!(!contains(&bytes, MARKER), "{}", path.display());
+                if path.file_name().is_some_and(|n| n == "LOCK") {
+                    // The directory lock: an empty file.
+                    assert!(bytes.is_empty());
+                    continue;
+                }
                 // Neither the token nor the fragment key is on disk; only
                 // BLAKE3(token).
                 assert!(!contains(&bytes, &f.token));

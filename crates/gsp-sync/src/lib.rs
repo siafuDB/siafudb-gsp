@@ -21,9 +21,21 @@
 //! - it stores [`Replica::to_bytes`] in the same atomic write as the engine's
 //!   data.
 //!
-//! A **transport** talks to the relay: it pushes [`Replica::outbox_peek`] and
-//! calls [`Replica::outbox_ack`], pulls after [`Replica::cursor`] and hands
-//! every item to [`Replica::ingest`].
+//! A **transport** talks to the relay. One round:
+//!
+//! 1. push [`Replica::outbox_peek`], and on the relay's `Ack` call
+//!    [`Replica::outbox_ack`];
+//! 2. pull after [`Replica::cursor`]; hand `Batch.next` to
+//!    [`Replica::observe_relay_head`] and every item, with its position, to
+//!    [`Replica::ingest`]. Never stop at an item because of its status: the
+//!    cursor moves past everything;
+//! 3. if [`Replica::needs_resync`], schedule (with a growing delay) a
+//!    [`Replica::start_resync`] followed by a pull from the start;
+//! 4. if [`Replica::forked`], tell the application: the device has to
+//!    [`Replica::reset_identity`] before it can write again.
+//!
+//! The relay token is per relay: [`Replica::relay_token`] takes the relay's
+//! origin.
 //!
 //! ## Effects
 //!
@@ -51,23 +63,37 @@
 //! unequal to itself; the replica itself compares values by their encoding
 //! when it decides whether something changed.
 //!
-//! ## Decisions this crate makes where SYNC-V0 leaves room
+//! ## How a replica stays live
 //!
-//! - **Clock drift.** An op whose HLC is more than `max_drift_ms` ahead of
-//!   `now_ms` is *held* ([`PendingReason::ClockAhead`]), not rejected, and
-//!   applied by a later [`Replica::ingest`] or [`Replica::poll`] once local
-//!   time has caught up. Its timestamp is not merged into the local clock
-//!   before that. Rejecting would lose the op for good, because the pull
-//!   cursor moves past it.
-//! - **Full pending storage.** Pending ops are bounded in count and bytes
-//!   ([`Config`]). An op that would have to wait when the store is full is
-//!   refused ([`IngestStatus::PendingFull`]): it is not kept and the pull
-//!   cursor does not move past it, so nothing is lost silently. See
-//!   [`Replica::clear_pending`] for the way out.
-//! - **Unverifiable items are dropped**, and counted in
-//!   [`Stats::unsupported`]: unknown formats and algorithms, batches (kind
-//!   2), and key-log entries other than a genesis. v0 has no key rotation or
-//!   revocation, so a key log is its genesis entry.
+//! - **An op applies when its author's key log is known and the author's
+//!   previous op is applied.** Nothing else gates it. `deps` are written
+//!   (the heads of the other authors) as causal metadata and are not
+//!   consulted, so one author's stuck or forked chain never holds back
+//!   another author's ops.
+//! - **The cursor always advances.** Whatever an item turns out to be, the
+//!   replica does not ask for it again because of it.
+//! - **Pending ops are bounded** per author and in total ([`Config`]). When a
+//!   bound is hit an op is dropped ([`IngestStatus::PendingFull`]; for an
+//!   author over its share, the op furthest from being applicable), the
+//!   author is marked ([`AuthorStatus::gap`]) and [`Replica::needs_resync`]
+//!   turns on. A resync replays the relay log from the start; replay is
+//!   idempotent.
+//! - **Clocks.** An op whose HLC leads `now_ms` by more than `max_drift_ms`
+//!   is held ([`PendingReason::ClockAhead`]) and applied once local time has
+//!   caught up; its timestamp is not merged into the local clock before
+//!   that. One that leads by more than `max_clock_ahead_ms` (24 hours) is
+//!   rejected ([`Reject::ClockTooFarAhead`]). Both show in
+//!   [`AuthorStatus::clock_lead_ms`], so an application can say whose clock
+//!   is wrong.
+//! - **Unverifiable ops are kept** ([`PendingReason::Unverifiable`]), within
+//!   the same bounds, and evaluated again after a restore.
+//! - **Rollback is detected.** See [`Replica::forked`].
+//!
+//! ## Other decisions where SYNC-V0 leaves room
+//!
+//! - **Not handled in v0**, dropped and counted in [`Stats::unsupported`]:
+//!   batches (kind 2) and key-log entries other than a genesis. v0 has no
+//!   key rotation or revocation, so a key log is its genesis entry.
 //! - **Node and edge gids are separate namespaces.** A node tombstone does
 //!   not tombstone an edge with the same gid.
 //! - **Stamp order** is `(hlc.wall_ms, hlc.counter, hash algorithm id, digest
@@ -92,10 +118,10 @@ pub use change::{
 };
 pub use merge::{EdgeView, NodeView};
 pub use pairing::{
-    CTX_FRAGMENT_ID, CTX_FRAGMENT_KEY, CTX_RELAY_TOKEN, FRAGMENT_ID_LEN, PAIRING_PREFIX, Pairing,
-    PairingError, base64url,
+    CTX_FRAGMENT_ID, CTX_FRAGMENT_KEY, CTX_RELAY_TOKEN, FRAGMENT_ID_LEN, OriginError,
+    PAIRING_PREFIX, Pairing, PairingError, base64url, canonical_origin,
 };
 pub use replica::{
-    Config, Equivocation, Error, IngestOutcome, IngestStatus, MAX_EQUIVOCATIONS, MAX_SEALED_BYTES,
-    PendingReason, Reject, Replica, Stats,
+    AuthorStatus, Config, Equivocation, Error, IngestOutcome, IngestStatus, MAX_EQUIVOCATIONS,
+    MAX_SEALED_BYTES, PendingReason, Reject, Replica, Stats,
 };

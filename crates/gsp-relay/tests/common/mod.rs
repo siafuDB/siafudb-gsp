@@ -24,7 +24,12 @@ impl Rng {
         (self.next() % n.max(1) as u64) as usize
     }
     pub fn bytes(&mut self, n: usize) -> Vec<u8> {
-        (0..n).map(|_| self.next() as u8).collect()
+        let mut out = Vec::with_capacity(n + 8);
+        while out.len() < n {
+            out.extend_from_slice(&self.next().to_le_bytes());
+        }
+        out.truncate(n);
+        out
     }
 }
 

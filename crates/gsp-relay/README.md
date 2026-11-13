@@ -44,8 +44,18 @@ GSP_RELAY_DATA_DIR=/var/lib/gsp-relay ./target/release/gsp-relay
 ./target/release/gsp-relay --addr 127.0.0.1:8787 --data-dir /var/lib/gsp-relay
 ```
 
-Without a data directory everything is kept in memory and lost on exit; the
-startup line says so. SIGINT or SIGTERM stops accepting connections, answers
+Storage has to be chosen. With neither `--data-dir` nor `--in-memory` the
+relay exits with status 2 and a message saying so. `--in-memory` keeps nothing
+on disk: every item, token registration and cursor is lost when the process
+stops, and the relay prints a warning at startup. It is meant for tests and
+demos. `--fsync never` also prints a warning at startup.
+
+A relay reachable from the internet should set a registration secret
+(`GSP_RELAY_REGISTRATION_TOKEN`, see Registration) or sit behind something
+that authenticates callers. Without one, anyone who can reach it can register
+fragments until its quotas are used up; the relay says so at startup.
+
+SIGINT or SIGTERM stops accepting connections, answers
 held long-polls with an empty `Batch`, and waits up to the shutdown grace for
 requests in flight.
 
@@ -53,8 +63,12 @@ A small client that pushes, pulls, opens what it pulled and holds a
 long-poll:
 
 ```sh
+./target/release/gsp-relay --in-memory &
 cargo run -p gsp-relay --example roundtrip -- 127.0.0.1:8787
 ```
+
+The example sends `x-gsp-registration` if `GSP_RELAY_REGISTRATION_TOKEN` is
+set in its environment.
 
 ## Endpoints
 
@@ -71,8 +85,16 @@ Bodies are single CBOR frames. Push and pull need
 - The first non-empty push to a fragment id registers `BLAKE3(token)`. After
   that any other token gets `401` on push and pull. Comparison is
   constant-time.
+- Registration and storing the first items are one step. Every limit (item
+  size, item count, fragment quota, relay-wide quota, fragment count,
+  registration secret) is checked before anything is written. A first push
+  that is refused, or that fails in the store, leaves nothing behind: the
+  fragment is not registered and no file exists for it.
 - A pull on a fragment nobody has pushed to returns an empty `Batch`
-  (`next = 0`) and registers nothing.
+  (`next = 0`) at once and registers nothing. It is never held, whatever
+  `wait_ms` says, and does not count against the long-poll caps: anyone can
+  ask about any id, so holding such requests would let strangers use up the
+  long-poll slots.
 - Items are numbered from 1 per fragment. `Pull.after` is exclusive.
   `Batch.next` is the cursor of the last item returned; for an empty `Batch`
   it is the fragment's latest cursor. `Batch.more` is true when items exist
@@ -83,8 +105,20 @@ Bodies are single CBOR frames. Push and pull need
   again. (Equality is decided by BLAKE3 of the item bytes.)
 - Every `SealedOp.fragment_id` in a push must equal `Push.fragment_id`.
 - A push is all or nothing: if any check fails, none of its items is stored.
-- `wait_ms` above 25000 is treated as 25000. A long-poll returns as soon as
-  an item past `after` exists, or with an empty `Batch` when the time is up.
+- `wait_ms` above 25000 is treated as 25000. A pull is held only when the
+  fragment is registered, the token is right, and `after` equals the
+  fragment's latest cursor. It then returns as soon as a new item exists, or
+  with an empty `Batch` when the time is up.
+- **Detecting a relay that lost its data.** A pull whose `after` is greater
+  than the fragment's latest cursor is answered at once, never held, with an
+  empty `Batch` whose `next` is the relay's latest cursor (0 if the relay
+  does not know the fragment). So `Batch.next < Pull.after` always means: this
+  relay has fewer items than the client has already seen from it. It has
+  been reset or replaced and is numbering from 1 again. A client that sees
+  this should pull again from 0 (items it already has are harmless
+  duplicates) and push again whatever it cannot assume the relay still has.
+  There is no other signal in v0; a relay that was reset and has since grown
+  past the client's cursor cannot be told apart this way.
 
 Error replies carry an `Error` frame whose `code` is the HTTP status:
 
@@ -92,11 +126,13 @@ Error replies carry an `Error` frame whose `code` is the HTTP status:
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `400`        | Body is not a well-formed frame, is the wrong frame type, has an invalid fragment id, has an item addressed to another fragment, or `wait_ms` is not a number |
 | `401`        | Missing or malformed bearer token, or not the token registered for the fragment                                                                               |
+| `403`        | First push to a new fragment without the registration secret this relay requires (missing or wrong `x-gsp-registration`)                                      |
 | `404`, `405` | Unknown path, wrong method                                                                                                                                    |
 | `408`        | Request body not received within the read timeout                                                                                                             |
 | `413`        | Request body, item, or item count over the limit; or the push would exceed the fragment quota                                                                 |
 | `429`        | Too many concurrent long-polls (per fragment or overall); `retry-after: 1`                                                                                    |
 | `500`        | Storage error                                                                                                                                                 |
+| `503`        | The decode budget is in use by other pushes right now; `retry-after: 1`                                                                                       |
 | `507`        | The relay-wide quota or fragment count is exhausted                                                                                                           |
 
 Past a long-poll cap the reply is `429`, not an immediate empty `Batch`: an
@@ -105,7 +141,51 @@ once. Pulls with `wait_ms=0` are never counted as long-polls.
 
 CORS: every reply has `access-control-allow-origin` (default `*`, plus
 `vary: origin` when configured to something else). Preflight replies allow
-`GET, POST, OPTIONS` and the headers `authorization, content-type`.
+`GET, POST, OPTIONS` and the headers `authorization, content-type,
+x-gsp-registration`.
+
+### Registration
+
+By default anyone who can reach the relay may register a fragment. With
+`--registration-token` / `GSP_RELAY_REGISTRATION_TOKEN` set, the first push
+to a new fragment must also carry `x-gsp-registration: <secret>`; without it,
+or with a wrong value, the reply is `403` and nothing is registered. The
+comparison is constant-time (BLAKE3 of both values).
+
+- Only registration is affected. Once a fragment exists, pushes and pulls
+  need only its relay token, so other devices of the same fragment do not
+  need the secret, and changing or removing the secret does not affect
+  existing fragments.
+- The secret does not replace a relay token and gives no access to existing
+  fragments.
+- It is one shared value for the whole relay, held in memory, never written
+  to the data directory and never logged. Prefer the environment variable:
+  command-line flags are visible in process listings.
+- It is sent on every first push, so it is only as private as the people and
+  apps it is given to. For anything finer (per-user accounts, revocation),
+  authenticate in front of the relay.
+
+### Order of checks on a push
+
+The cheap checks come first, so an unauthenticated request cannot make the
+relay do expensive work:
+
+1. bearer token syntax (before the body is read);
+2. body size, enforced while reading;
+3. a scan of the body's shape without allocation: it must be
+   `[3, bstr, [* [uint, uint, bstr, bstr, bstr]]]` and nothing else, with the
+   item count and each item's size inside the limits. Bodies of any other
+   shape (nested arrays, maps, wrong lengths) are refused here;
+4. the relay token if the fragment is registered, otherwise the registration
+   secret if the relay has one;
+5. only then the full strict decode by `gsp-wire` and the push itself, on a
+   blocking thread, not on the async workers. At most `--max-decode-bytes`
+   of request bodies are in this stage at once; a push that does not fit
+   gets `503` with `retry-after: 1` instead of being queued.
+
+A body that passes step 3 is flat, so decoding it costs time and memory
+proportional to its size. Pull bodies are at most 1 KiB and are decoded in
+place after the same kind of scan.
 
 ## Configuration
 
@@ -114,7 +194,10 @@ Each flag can also be set through the environment variable. A flag wins.
 | Flag                       | Environment                        | Default          | Meaning                                                                                |
 | -------------------------- | ---------------------------------- | ---------------- | -------------------------------------------------------------------------------------- |
 | `--addr`                   | `GSP_RELAY_ADDR`                   | `127.0.0.1:8787` | Listen address                                                                         |
-| `--data-dir`               | `GSP_RELAY_DATA_DIR`               | unset (memory)   | Directory for the durable store                                                        |
+| `--data-dir`               | `GSP_RELAY_DATA_DIR`               | unset            | Directory for the durable store. Required unless `--in-memory`                         |
+| `--in-memory`              | `GSP_RELAY_IN_MEMORY=1`            | off              | Keep nothing on disk; all data and cursors are lost on exit. Excludes `--data-dir`     |
+| `--registration-token`     | `GSP_RELAY_REGISTRATION_TOKEN`     | unset (open)     | Secret a first push to a new fragment must send in `x-gsp-registration`                |
+| `--max-decode-bytes`       | `GSP_RELAY_MAX_DECODE_BYTES`       | 8388608          | Request-body bytes being decoded and processed at once; at least `max-request-bytes`   |
 | `--cors-origin`            | `GSP_RELAY_CORS_ORIGIN`            | `*`              | `access-control-allow-origin` value                                                    |
 | `--fsync`                  | `GSP_RELAY_FSYNC`                  | `always`         | `always` or `never`, see Durability                                                    |
 | `--max-item-bytes`         | `GSP_RELAY_MAX_ITEM_BYTES`         | 262144           | Largest encoded `SealedOp`                                                             |
@@ -163,7 +246,17 @@ same after a restart.
   for a torn tail after a crash. Damage in the middle of a file is handled
   the same way and loses the records after it.
 - A `.log` file with a bad header stops startup rather than being discarded.
-- Run one relay process per data directory. There is no lock file.
+- A fragment file that holds no items after replay is deleted at startup and
+  its registration is not restored. Such a file can only come from a crash
+  between creating a fragment and storing its first item, or from a torn
+  first record; no push to it was ever acknowledged (with `--fsync always`).
+  While the relay runs, a registered fragment always has at least one item,
+  so there are no empty registrations to expire and no idle timer for them.
+- `<data-dir>/LOCK` is held with an exclusive advisory file lock while the
+  relay runs. A second relay started on the same directory exits with an
+  error naming the directory. The OS releases the lock when the process
+  ends, however it ends, so a leftover `LOCK` file never blocks a start. On
+  network file systems advisory locks may not be reliable.
 
 ## Behind TLS
 
@@ -214,10 +307,14 @@ first four bytes of a fragment id are.
 
 ## Limits and known weaknesses
 
-- Anyone who can reach the relay can register new fragments until
-  `max-fragments` or the total quota is used up. There are no accounts and no
-  rate limits. An operator who wants a closed relay has to restrict access in
-  front of it.
+- Without a registration secret, anyone who can reach the relay can register
+  new fragments and store items until `max-fragments` or the total quota is
+  used up, after which nobody can store anything new. Set
+  `GSP_RELAY_REGISTRATION_TOKEN` or restrict access in front of the relay.
+  With the secret, the same is true of anyone who holds it. There are no
+  accounts and no rate limits.
+- Fragments that hold items never expire, and nothing is ever deleted. The
+  only way to free space is to stop the relay and delete fragment files.
 - Whoever pushes first to a fragment id owns it on this relay. Fragment ids
   are 128-bit values derived from the root secret, so guessing one is not
   practical, but someone who learns an id before its owner's first push can
@@ -226,6 +323,11 @@ first four bytes of a fragment id are.
   answers `401` to a wrong token, an unregistered one answers `200` with an
   empty `Batch`.
 - There is no deletion, compaction, expiry, or token rotation.
+- A pull on a fragment waits for a push to the same fragment that is in the
+  middle of its disk write.
+- Request bodies are buffered before the decode budget applies: up to
+  `max-connections` times `max-request-bytes` can be held while bodies
+  arrive.
 - All fragment indexes are loaded at startup and kept in memory: about 40 to
   80 bytes per stored item (a 32-byte hash for dedupe plus an offset).
 - HTTP/1.1 only. No HTTP/2, no WebSocket; one long-poll holds one connection.
@@ -251,3 +353,7 @@ dedupe, long-poll, tokens, every limit, CORS, concurrent pushers, the
 confidentiality marker test). `tests/durability.rs` covers restarts and torn
 tails. `tests/net.rs` uses a real listener and a hand-written HTTP client.
 `tests/fuzz.rs` feeds random, truncated and mutated bodies to both endpoints.
+`tests/hardening.rs` holds the regression tests for resource exhaustion:
+long-poll slots, refused first pushes, decode cost and budget, the
+registration secret, empty fragments after a crash, cursors beyond the head,
+and the directory lock.

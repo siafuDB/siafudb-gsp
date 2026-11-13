@@ -257,7 +257,9 @@ fn forged_signatures_are_rejected() {
     );
 
     // 4. Another device of the fragment signs an op in this author's name:
-    // the key is not in the author's log.
+    // the key is not in the author's log. That is unverifiable, not invalid
+    // (a newer key log could explain it), so the bytes are kept; it is never
+    // applied.
     let mut imposter = Forge::new(ROOT, 77);
     let mut body = imposter.body(
         1,
@@ -269,7 +271,11 @@ fn forged_signatures_are_rejected() {
     body.author = f.author();
     let forged = imposter.sign(&body);
     let out = d.ingest(&imposter.sealed_op(&forged), 0, T0);
-    assert_eq!(rejected(&out), &Reject::Unsupported);
+    assert_eq!(
+        out.status,
+        IngestStatus::Pending(PendingReason::Unverifiable)
+    );
+    assert!(out.effects.is_empty());
 
     // 5. A key-log genesis whose proof of possession is broken.
     let mut g = Signed::from_bytes(&imposter.genesis).unwrap();
@@ -279,14 +285,17 @@ fn forged_signatures_are_rejected() {
 
     assert!(d.r.nodes().is_empty());
     assert_eq!(d.r.stats().applied, 0);
-    assert_eq!(d.r.stats().pending, 0);
+    assert_eq!(d.r.stats().pending, 1, "only the unverifiable copy is held");
     assert_eq!(d.r.stats().authors, 2);
-    // The real op is unaffected by the attempts.
+    // The real op is unaffected by the attempts, and once the position is
+    // settled the unverifiable rival is let go.
     assert_eq!(
         d.ingest(&f.sealed_op(&good), 0, T0).status,
         IngestStatus::Applied
     );
     assert_eq!(d.r.node(&gid(1)).unwrap().props, props(&[("k", int(1))]));
+    assert_eq!(d.r.stats().pending, 0);
+    assert_eq!(d.r.stats().applied, 1);
 }
 
 #[test]
@@ -516,7 +525,8 @@ fn chain_rules_wrong_prev_and_clock_going_backwards() {
         d.ingest(&f.sealed_op(&f.sign(&body)), 0, T0).status,
         IngestStatus::Pending(PendingReason::MissingPrev)
     );
-    // seq 3 whose prev is an applied op that is not the author's seq 2.
+    // seq 3 whose prev is not what will be the author's seq 2: it waits for
+    // its position like any early op, and is found out when seq 2 applies.
     let mut body = f.body(
         3,
         Some(&op1),
@@ -526,8 +536,8 @@ fn chain_rules_wrong_prev_and_clock_going_backwards() {
     );
     body.prev = Some(op1.id().clone());
     assert_eq!(
-        rejected(&d.ingest(&f.sealed_op(&f.sign(&body)), 0, T0)),
-        &Reject::ChainFork
+        d.ingest(&f.sealed_op(&f.sign(&body)), 0, T0).status,
+        IngestStatus::Pending(PendingReason::MissingPrev)
     );
     // seq 2 with an HLC equal to, and lower than, seq 1's.
     for wall in [T0 + 10, T0 + 9] {
@@ -540,12 +550,15 @@ fn chain_rules_wrong_prev_and_clock_going_backwards() {
     assert!(d.r.node(&gid(2)).is_none());
     // A correct seq 2 still applies. The op with the bogus prev was at
     // "seq 2" as well, but it never applied, so this is no equivocation.
+    let invalid = d.r.stats().invalid;
     let op2 = f.op(2, Some(&op1), T0 + 11, &[node(2, &[], &[])]);
-    assert_eq!(
-        d.ingest(&f.sealed_op(&op2), 0, T0).status,
-        IngestStatus::Applied
-    );
-    assert_eq!(d.r.stats().equivocations, 0);
+    let out = d.ingest(&f.sealed_op(&op2), 0, T0);
+    assert_eq!((out.status, out.applied), (IngestStatus::Applied, 1));
+    let st = d.r.stats();
+    assert_eq!(st.equivocations, 0);
+    // The waiting "seq 3" turned out not to continue the chain and is gone;
+    // the "seq 4" still waits for a seq 3.
+    assert_eq!((st.invalid, st.pending), (invalid + 1, 1));
 }
 
 #[test]
@@ -761,68 +774,39 @@ fn an_op_before_its_key_log_waits_for_it() {
 }
 
 #[test]
-fn deps_that_never_arrive_keep_the_op_pending_without_blocking_others() {
+fn deps_are_advisory_and_never_hold_an_op_back() {
+    // An op names a dep nobody will ever see. It applies all the same: merge
+    // is a function of the set of ops, and what another author did or did
+    // not do is no reason to withhold this one.
     let mut f = Forge::new(ROOT, 9);
     let mut d = dev_knowing(&mut f);
     let ghost = f.sign(&f.body(
         1,
         None,
         T0,
-        vec![fake_id(0xdd)],
+        vec![fake_id(0xdd), fake_id(0xde)],
         encode_payload(&[node(1, &[], &[])]).unwrap(),
     ));
     let out = d.ingest(&f.sealed_op(&ghost), 0, T0);
-    assert_eq!(out.status, IngestStatus::Pending(PendingReason::MissingDep));
-
-    // Other authors carry on; local commits carry on.
-    let mut g = Forge::new(ROOT, 10);
-    d.ingest(&g.sealed_genesis(), 0, T0);
-    let ok = g.op(1, None, T0, &[node(2, &[], &[])]);
-    assert_eq!(
-        d.ingest(&g.sealed_op(&ok), 0, T0).status,
-        IngestStatus::Applied
-    );
-    d.commit(&[node(3, &[], &[])], T0 + 1);
-
-    for t in [T0 + 10, T0 + 10_000_000] {
-        assert!(d.poll(t).is_empty());
-        d.restore();
-    }
-    assert!(d.r.node(&gid(1)).is_none());
-    let st = d.r.stats();
-    assert_eq!((st.pending, st.applied, st.invalid), (1, 1, 0));
-    // Offered again it is recognised as already held.
-    assert_eq!(
-        d.ingest(&f.sealed_op(&ghost), 0, T0).status,
-        IngestStatus::Duplicate
-    );
-
-    // An op that depends on itself-like nonsense among real deps: the real
-    // one being present does not help.
-    let half = g.sign(&g.body(
-        2,
-        Some(&ok),
-        T0 + 2,
-        vec![ok.id().clone(), fake_id(0xdc)],
-        encode_payload(&[node(4, &[], &[])]).unwrap(),
-    ));
-    assert_eq!(
-        d.ingest(&g.sealed_op(&half), 0, T0).status,
-        IngestStatus::Pending(PendingReason::MissingDep)
-    );
-    // The way out, if they pile up.
-    assert_eq!(d.r.clear_pending(), 2);
+    assert_eq!((out.status, out.applied), (IngestStatus::Applied, 1));
+    assert!(d.r.node(&gid(1)).is_some());
     assert_eq!(d.r.stats().pending, 0);
-    assert_eq!(d.r.stats().pending_bytes, 0);
+    assert!(!d.r.needs_resync());
 }
 
 #[test]
-fn deps_on_another_authors_op_are_honoured() {
+fn an_op_applies_before_the_op_of_another_author_it_names() {
+    // G's op was written after seeing F's op and names it in `deps`. A
+    // replica that gets G's first applies it at once; when F's arrives the
+    // stamps decide, and the result is the same as in the other order.
     let mut f = Forge::new(ROOT, 9);
     let mut g = Forge::new(ROOT, 10);
-    let mut d = dev_knowing(&mut f);
-    d.ingest(&g.sealed_genesis(), 0, T0);
-    let base = f.op(1, None, T0, &[node(1, &[], &[("k", int(1))])]);
+    let base = f.op(
+        1,
+        None,
+        T0,
+        &[node(1, &[], &[("k", int(1)), ("j", int(1))])],
+    );
     let later = g.sign(&g.body(
         1,
         None,
@@ -830,80 +814,332 @@ fn deps_on_another_authors_op_are_honoured() {
         vec![base.id().clone()],
         encode_payload(&[node(1, &[], &[("k", int(2))])]).unwrap(),
     ));
-    let out = d.ingest(&g.sealed_op(&later), 0, T0 + 2);
-    assert_eq!(out.status, IngestStatus::Pending(PendingReason::MissingDep));
-    assert!(d.r.nodes().is_empty());
-    let out = d.ingest(&f.sealed_op(&base), 0, T0 + 2);
-    assert_eq!((out.status, out.applied), (IngestStatus::Applied, 2));
-    assert_eq!(d.r.node(&gid(1)).unwrap().props, props(&[("k", int(2))]));
+    let (sb, sl) = (f.sealed_op(&base), g.sealed_op(&later));
+    let mut results = Vec::new();
+    for order in [[&sl, &sb], [&sb, &sl]] {
+        let mut d = dev_knowing(&mut f);
+        d.ingest(&g.sealed_genesis(), 0, T0);
+        for item in order {
+            let out = d.ingest(item, 0, T0 + 2);
+            assert_eq!((out.status, out.applied), (IngestStatus::Applied, 1));
+        }
+        assert_eq!(
+            d.r.node(&gid(1)).unwrap().props,
+            props(&[("k", int(2)), ("j", int(1))])
+        );
+        results.push(d.r.snapshot());
+    }
+    assert_eq!(results[0], results[1]);
 }
 
 #[test]
-fn pending_storage_is_bounded_and_a_refused_item_holds_the_cursor() {
+fn pending_is_bounded_per_author_and_never_holds_the_cursor() {
     let config = Config {
-        max_pending_items: 2,
+        max_pending_items_per_author: 3,
+        ..Config::default()
+    };
+    let mut f = Forge::new(ROOT, 9);
+    let mut g = Forge::new(ROOT, 10);
+    let mut d = Dev::with(ROOT, 1, config);
+    d.ingest(&f.sealed_genesis(), 1, T0);
+    d.ingest(&g.sealed_genesis(), 2, T0);
+    let chain = |f: &Forge, n: u64, base: u8| {
+        let mut ops: Vec<Op> = Vec::new();
+        for i in 0..n {
+            let op = f.op(i + 1, ops.last(), T0 + i, &[node(base + i as u8, &[], &[])]);
+            ops.push(op);
+        }
+        ops
+    };
+    let fo = chain(&f, 8, 10);
+    let go = chain(&g, 8, 50);
+    let fs: Vec<Vec<u8>> = fo.iter().map(|o| f.sealed_op(o)).collect();
+    let gs: Vec<Vec<u8>> = go.iter().map(|o| g.sealed_op(o)).collect();
+
+    // The relay lost F's first op (or delivers it last): F's ops 2..8 arrive
+    // with nothing to stand on. Three are kept, the lowest three.
+    let mut seq = 2;
+    let mut statuses = Vec::new();
+    for item in &fs[1..] {
+        seq += 1;
+        statuses.push(d.ingest(item, seq, T0 + 100).status);
+        assert_eq!(d.r.cursor(), seq, "the cursor moves past every item");
+    }
+    assert_eq!(
+        statuses[..3],
+        [
+            IngestStatus::Pending(PendingReason::MissingPrev),
+            IngestStatus::Pending(PendingReason::MissingPrev),
+            IngestStatus::Pending(PendingReason::MissingPrev)
+        ]
+    );
+    assert!(
+        statuses[3..]
+            .iter()
+            .all(|s| *s == IngestStatus::PendingFull)
+    );
+    let st = d.r.stats();
+    assert_eq!((st.pending, st.refused), (3, 4));
+    assert!(st.needs_resync && d.r.needs_resync());
+    let status_of = |d: &Dev, who: &Forge| {
+        d.r.authors()
+            .into_iter()
+            .find(|a| a.author == who.author())
+            .unwrap()
+    };
+    let fa = status_of(&d, &f);
+    assert_eq!(
+        (fa.applied_seq, fa.pending, fa.gap, fa.own),
+        (0, 3, true, false)
+    );
+
+    // G is not affected in any way: all eight of its ops apply, in relay
+    // order, while F is stuck.
+    for item in &gs {
+        seq += 1;
+        assert_eq!(d.ingest(item, seq, T0 + 100).status, IngestStatus::Applied);
+    }
+    let ga = status_of(&d, &g);
+    assert_eq!((ga.applied_seq, ga.pending, ga.gap), (8, 0, false));
+    assert_eq!(d.r.nodes().len(), 8);
+    // So are local commits.
+    d.commit(&[node(200, &[], &[])], T0 + 101);
+
+    // An op nearer the head displaces the furthest one instead of being
+    // dropped: with op 2..4 held, op 1 would apply, so take a fresh replica
+    // holding 5, 6, 7 and offer 3.
+    let mut e = Dev::with(ROOT, 2, config);
+    e.ingest(&f.sealed_genesis(), 0, T0);
+    for i in [4, 5, 6] {
+        e.ingest(&fs[i], 0, T0 + 100);
+    }
+    assert_eq!(
+        e.ingest(&fs[2], 0, T0 + 100).status,
+        IngestStatus::Pending(PendingReason::MissingPrev)
+    );
+    assert_eq!(e.r.stats().pending, 3);
+    assert_eq!(e.r.stats().refused, 1);
+    for i in [0, 1] {
+        e.ingest(&fs[i], 0, T0 + 100);
+    }
+    assert_eq!(status_of(&e, &f).applied_seq, 3, "1, 2 and the kept 3");
+    assert_eq!(
+        e.r.stats().pending,
+        2,
+        "5 and 6 wait for 4; 7 was displaced"
+    );
+
+    // Recovery: the relay does have F's first op after all (it arrived
+    // late, at the end of the log). The replica applies what it kept, and a
+    // resync from the start fetches what it dropped. Replay is idempotent.
+    seq += 1;
+    let out = d.ingest(&fs[0], seq, T0 + 102);
+    assert_eq!((out.status, out.applied), (IngestStatus::Applied, 4));
+    assert!(
+        d.r.needs_resync(),
+        "ops 5..8 were dropped and are still missing"
+    );
+    d.r.start_resync();
+    assert_eq!(d.r.cursor(), 0);
+    assert!(!d.r.needs_resync());
+    let log: Vec<&Vec<u8>> = fs[1..].iter().chain(&gs).chain([&fs[0]]).collect();
+    let mut effects = 0;
+    for (i, item) in log.iter().enumerate() {
+        effects += d.ingest(item, i as u64 + 3, T0 + 103).effects.len();
+    }
+    assert_eq!(effects, 4, "exactly the four nodes that were missing");
+    assert_eq!(status_of(&d, &f).applied_seq, 8);
+    assert!(!d.r.needs_resync());
+    assert_eq!(d.r.stats().pending, 0);
+    assert_eq!(d.r.cursor(), seq);
+    assert_eq!(d.r.nodes().len(), 17);
+}
+
+#[test]
+fn the_global_pending_bound_drops_the_incoming_op() {
+    // Ops of authors without a key log count against the claimed author; an
+    // insider inventing authors runs into the bound on the whole store.
+    let config = Config {
+        max_pending_items: 4,
+        ..Config::default()
+    };
+    let mut d = Dev::with(ROOT, 1, config);
+    let mut statuses = Vec::new();
+    for i in 0..6u8 {
+        let mut ghost = Forge::new(ROOT, 100 + i);
+        let op = ghost.op(1, None, T0, &[node(i, &[], &[])]);
+        statuses.push(d.ingest(&ghost.sealed_op(&op), u64::from(i) + 1, T0).status);
+    }
+    assert!(
+        statuses[..4]
+            .iter()
+            .all(|s| *s == IngestStatus::Pending(PendingReason::UnknownAuthor))
+    );
+    assert_eq!(
+        statuses[4..],
+        [IngestStatus::PendingFull, IngestStatus::PendingFull]
+    );
+    assert_eq!(d.r.cursor(), 6);
+    assert!(d.r.needs_resync());
+    assert_eq!(d.r.stats().pending, 4);
+    // The byte bounds work the same way.
+    let mut f = Forge::new(ROOT, 9);
+    let op1 = f.op(1, None, T0, &[node(1, &[], &[])]);
+    let op2 = f.op(2, Some(&op1), T0 + 1, &[node(2, &[], &[])]);
+    let op3 = f.op(3, Some(&op2), T0 + 2, &[node(3, &[], &[])]);
+    let one = op2.to_bytes().unwrap().len();
+    for config in [
+        Config {
+            max_pending_bytes: one + 10,
+            ..Config::default()
+        },
+        Config {
+            max_pending_bytes_per_author: one + 10,
+            ..Config::default()
+        },
+    ] {
+        let mut d = Dev::with(ROOT, 1, config);
+        d.ingest(&f.sealed_genesis(), 0, T0);
+        assert!(matches!(
+            d.ingest(&f.sealed_op(&op2), 0, T0).status,
+            IngestStatus::Pending(_)
+        ));
+        assert_eq!(
+            d.ingest(&f.sealed_op(&op3), 0, T0).status,
+            IngestStatus::PendingFull
+        );
+        assert!(d.r.stats().pending_bytes <= one + 10);
+        assert!(d.r.needs_resync());
+    }
+}
+
+#[test]
+fn needs_resync_survives_a_restore_and_clear_pending_empties_the_store() {
+    let config = Config {
+        max_pending_items_per_author: 1,
         ..Config::default()
     };
     let mut f = Forge::new(ROOT, 9);
     let mut d = Dev::with(ROOT, 1, config);
-    let mut ops: Vec<Op> = Vec::new();
-    for i in 0..4u64 {
-        let op = f.op(i + 1, ops.last(), T0 + i, &[node(i as u8 + 1, &[], &[])]);
-        ops.push(op);
-    }
-    let sealed: Vec<Vec<u8>> = ops.iter().map(|o| f.sealed_op(o)).collect();
-    // The relay holds: op1..op4 at 1..4, the key log at 5.
-    assert!(matches!(
-        d.ingest(&sealed[0], 1, T0).status,
-        IngestStatus::Pending(_)
-    ));
-    assert!(matches!(
-        d.ingest(&sealed[1], 2, T0).status,
-        IngestStatus::Pending(_)
-    ));
-    assert_eq!(d.r.cursor(), 2);
-    let out = d.ingest(&sealed[2], 3, T0);
-    assert_eq!(out.status, IngestStatus::PendingFull);
-    assert_eq!(d.r.cursor(), 2, "the refused item is still to be fetched");
-    assert_eq!(d.r.stats().pending, 2);
-    assert_eq!(d.r.stats().refused, 1);
-    // A transport that carries on regardless cannot skip it.
-    assert_eq!(
-        d.ingest(&sealed[3], 4, T0).status,
-        IngestStatus::PendingFull
-    );
-    let out = d.ingest(&f.sealed_genesis(), 5, T0);
-    assert_eq!((out.status, out.applied), (IngestStatus::KeyLog, 2));
-    assert_eq!(d.r.cursor(), 2);
-    assert_eq!(d.r.stats().pending, 0);
+    d.ingest(&f.sealed_genesis(), 0, T0);
+    let op1 = f.op(1, None, T0, &[node(1, &[], &[])]);
+    let op2 = f.op(2, Some(&op1), T0 + 1, &[node(2, &[], &[])]);
+    let op3 = f.op(3, Some(&op2), T0 + 2, &[node(3, &[], &[])]);
+    d.ingest(&f.sealed_op(&op2), 0, T0);
+    d.ingest(&f.sealed_op(&op3), 0, T0);
+    assert!(d.r.needs_resync());
+    d.restore();
+    assert!(d.r.needs_resync());
+    assert_eq!(d.r.clear_pending(), 1);
+    assert_eq!(d.r.stats().pending_bytes, 0);
+}
 
-    // Pulling again from the cursor now gets everything in.
-    assert_eq!(d.ingest(&sealed[2], 3, T0).status, IngestStatus::Applied);
-    assert_eq!(d.r.cursor(), 3);
-    assert_eq!(d.ingest(&sealed[3], 4, T0).status, IngestStatus::Applied);
-    assert_eq!(
-        d.ingest(&f.sealed_genesis(), 5, T0).status,
-        IngestStatus::Duplicate
-    );
-    assert_eq!(d.r.cursor(), 5);
-    assert_eq!(d.r.nodes().len(), 4);
-
-    // The byte bound works the same way.
+#[test]
+fn authors_are_capped() {
     let config = Config {
-        max_pending_bytes: ops[0].to_bytes().unwrap().len() + 10,
+        max_authors: 3,
         ..Config::default()
     };
     let mut d = Dev::with(ROOT, 1, config);
-    assert!(matches!(
-        d.ingest(&sealed[0], 1, T0).status,
-        IngestStatus::Pending(_)
-    ));
+    let mut forges: Vec<Forge> = (0..4).map(|i| Forge::new(ROOT, 50 + i)).collect();
+    let g: Vec<Vec<u8>> = forges.iter_mut().map(Forge::sealed_genesis).collect();
+    assert_eq!(d.ingest(&g[0], 0, T0).status, IngestStatus::KeyLog);
+    assert_eq!(d.ingest(&g[1], 0, T0).status, IngestStatus::KeyLog);
+    // This device counts: the third foreign genesis is one too many.
+    assert_eq!(rejected(&d.ingest(&g[2], 0, T0)), &Reject::TooManyAuthors);
+    assert_eq!(rejected(&d.ingest(&g[3], 0, T0)), &Reject::TooManyAuthors);
+    let st = d.r.stats();
+    assert_eq!((st.authors, st.authors_refused), (3, 2));
+    assert_eq!(d.r.authors().len(), 3);
+    // Known authors are not affected: a repeat is still a duplicate, and
+    // their ops apply.
+    assert_eq!(d.ingest(&g[0], 0, T0).status, IngestStatus::Duplicate);
+    let op = forges[1].op(1, None, T0, &[node(1, &[], &[])]);
     assert_eq!(
-        d.ingest(&sealed[1], 2, T0).status,
-        IngestStatus::PendingFull
+        d.ingest(&forges[1].sealed_op(&op), 0, T0).status,
+        IngestStatus::Applied
     );
-    assert_eq!(d.r.cursor(), 1);
-    assert!(d.r.stats().pending_bytes <= config.max_pending_bytes);
+    // Ops of a refused author wait like those of any unknown author.
+    let op = forges[2].op(1, None, T0, &[node(2, &[], &[])]);
+    assert_eq!(
+        d.ingest(&forges[2].sealed_op(&op), 0, T0).status,
+        IngestStatus::Pending(PendingReason::UnknownAuthor)
+    );
+    assert_eq!(Config::default().max_authors, 64);
+}
+
+#[test]
+fn unverifiable_ops_are_kept_and_checked_again_after_a_restore() {
+    let mut f = Forge::new(ROOT, 9);
+    let mut d = dev_knowing(&mut f);
+    // An op in a format from the future, and one with an unknown hash.
+    let good = f.op(1, None, T0, &[node(1, &[], &[])]);
+    let mut items = match Value::decode(good.body_bytes()).unwrap() {
+        Value::Array(a) => a,
+        _ => panic!(),
+    };
+    items[0] = int(7);
+    let future_format = Signed {
+        body: Value::Array(items.clone()).encode().unwrap(),
+        sigs: good.sigs().to_vec(),
+    }
+    .to_bytes()
+    .unwrap();
+    items[0] = int(0);
+    items[1] = int(99);
+    let future_hash = Signed {
+        body: Value::Array(items).encode().unwrap(),
+        sigs: good.sigs().to_vec(),
+    }
+    .to_bytes()
+    .unwrap();
+    for bytes in [future_format, future_hash] {
+        let out = d.ingest(&f.seal(&Plain::Op(bytes)), 5, T0);
+        assert_eq!(
+            out.status,
+            IngestStatus::Pending(PendingReason::Unverifiable)
+        );
+    }
+    assert_eq!(d.r.cursor(), 5);
+    let st = d.r.stats();
+    assert_eq!((st.pending, st.unsupported, st.invalid), (2, 0, 0));
+    // They hold nothing up.
+    assert_eq!(
+        d.ingest(&f.sealed_op(&good), 0, T0).status,
+        IngestStatus::Applied
+    );
+    // They survive a restore, where they are looked at again (this build
+    // still cannot read them, a newer one could).
+    d.restore();
+    assert!(d.poll(T0 + 1).is_empty());
+    assert_eq!(d.r.stats().pending, 2);
+    // And they are bounded like everything else that is held.
+    let config = Config {
+        max_pending_items_per_author: 2,
+        ..Config::default()
+    };
+    let mut d = Dev::with(ROOT, 1, config);
+    for i in 0..4u8 {
+        let body = Value::Array(vec![int(9), int(i64::from(i))])
+            .encode()
+            .unwrap();
+        let bytes = Signed {
+            body,
+            sigs: good.sigs().to_vec(),
+        }
+        .to_bytes()
+        .unwrap();
+        let out = d.ingest(&f.seal(&Plain::Op(bytes)), 0, T0);
+        if i < 2 {
+            assert_eq!(
+                out.status,
+                IngestStatus::Pending(PendingReason::Unverifiable)
+            );
+        } else {
+            assert_eq!(out.status, IngestStatus::PendingFull);
+        }
+    }
+    assert!(d.r.needs_resync());
 }
 
 // ------------------------------------------------------------ clocks
@@ -996,6 +1232,73 @@ fn a_held_op_is_released_by_any_later_ingest() {
     assert_eq!(out.effects, vec![node(1, &[], &[])]);
 }
 
+#[test]
+fn an_op_beyond_the_clock_horizon_is_rejected_and_reported() {
+    let cfg = Config::default();
+    assert_eq!(cfg.max_clock_ahead_ms, 24 * 60 * 60 * 1000);
+    let mut f = Forge::new(ROOT, 9);
+    let mut g = Forge::new(ROOT, 10);
+    let mut d = dev_knowing(&mut f);
+    d.ingest(&g.sealed_genesis(), 0, T0);
+    let lead_of = |d: &Dev, who: &Forge| {
+        d.r.authors()
+            .into_iter()
+            .find(|a| a.author == who.author())
+            .unwrap()
+            .clock_lead_ms
+    };
+
+    // Exactly at the horizon: held. One millisecond beyond: rejected.
+    let at = f.op(1, None, T0 + cfg.max_clock_ahead_ms, &[node(1, &[], &[])]);
+    assert_eq!(
+        d.ingest(&f.sealed_op(&at), 1, T0).status,
+        IngestStatus::Pending(PendingReason::ClockAhead)
+    );
+    assert_eq!(lead_of(&d, &f), cfg.max_clock_ahead_ms);
+    let year = 365 * 24 * 3600 * 1000;
+    let beyond = g.op(1, None, T0 + year, &[node(2, &[], &[])]);
+    let out = d.ingest(&g.sealed_op(&beyond), 2, T0);
+    assert_eq!(rejected(&out), &Reject::ClockTooFarAhead);
+    assert_eq!(d.r.cursor(), 2);
+    let st = d.r.stats();
+    assert_eq!((st.clock_rejected, st.pending, st.invalid), (1, 1, 0));
+    // The application can tell whose clock it is, and by how much.
+    assert_eq!(lead_of(&d, &g), year);
+    assert!(!d.r.needs_resync(), "nothing a resync could fix right now");
+
+    // The author keeps writing with its wrong clock. Its ops queue behind
+    // the missing one, up to the author's bound, without touching anyone
+    // else: here the device itself and author F.
+    let mut prev = beyond.clone();
+    for i in 0..300u64 {
+        let op = g.op(i + 2, Some(&prev), T0 + year + 1 + i, &[node(3, &[], &[])]);
+        d.ingest(&g.sealed_op(&op), 3 + i, T0);
+        prev = op;
+    }
+    let st = d.r.stats();
+    assert_eq!(st.pending, 1 + cfg.max_pending_items_per_author);
+    assert_eq!(st.refused, 300 - cfg.max_pending_items_per_author as u64);
+    assert_eq!(d.r.cursor(), 302);
+    assert!(d.r.needs_resync());
+    d.commit(&[node(9, &[], &[])], T0 + 1);
+    assert_eq!(
+        d.poll(T0 + cfg.max_clock_ahead_ms - cfg.max_drift_ms),
+        vec![node(1, &[], &[])]
+    );
+    assert_eq!(lead_of(&d, &f), 0, "applied: nothing wrong any more");
+
+    // When the wall clock does get there, a resync brings the author in.
+    d.r.start_resync();
+    let late = T0 + year;
+    assert_eq!(
+        d.ingest(&g.sealed_op(&beyond), 2, late).status,
+        IngestStatus::Applied
+    );
+    assert_eq!(lead_of(&d, &g), 0);
+    // The local clock was never dragged forward by the rejected timestamp.
+    assert!(d.r.node(&gid(2)).is_some());
+}
+
 // ------------------------------------------------------------ confidentiality
 
 #[test]
@@ -1044,7 +1347,13 @@ fn nothing_handed_to_the_outbox_contains_plaintext() {
         ("gid", marker_gid.to_vec()),
         ("root secret", ROOT.to_vec()),
         ("fragment key", pairing.fragment_key_bytes().to_vec()),
-        ("relay token", pairing.relay_token().to_vec()),
+        (
+            "relay token",
+            pairing
+                .relay_token("https://relay.example")
+                .unwrap()
+                .to_vec(),
+        ),
         ("author id of A", a.r.author().digest),
         ("author id of B", b.r.author().digest),
         ("device seed of A", vec![1u8; 32]),
