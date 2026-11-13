@@ -360,6 +360,98 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 48,
+        max_shrink_iters: 1000,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    /// A replica whose state is rolled back to any earlier point, and which
+    /// then pulls before writing, ends up where it would have been: same
+    /// visible graph, same position in every author's chain (its own
+    /// included), not forked, and its next op is accepted by a peer as the
+    /// continuation of the same chain.
+    #[test]
+    fn fast_forward_equals_never_rolled_back(
+        (n, steps, seed) in scenario(),
+        at in any::<usize>(),
+        shuffled_first in any::<bool>(),
+    ) {
+        let mut w = World::new(n);
+        let at = at % (steps.len() + 1);
+        let mut saved = w.devs[0].r.to_bytes().unwrap();
+        for (i, s) in steps.iter().enumerate() {
+            if i == at {
+                saved = w.devs[0].r.to_bytes().unwrap();
+            }
+            w.run(s);
+        }
+        w.settle(seed);
+        w.assert_converged();
+        let now = w.now + 10;
+
+        // Roll device 0 back and let it pull.
+        let r = Replica::from_bytes(&saved, Config::default()).unwrap();
+        let mut rolled = Dev {
+            model: Model::of(&r),
+            r,
+            rng: Rng(seed ^ 0xABCD_EF01),
+            config: Config::default(),
+        };
+        let mut rng = Rng(seed | 1);
+        if shuffled_first {
+            // A flaky first attempt: half the log in any order.
+            for _ in 0..w.log.len() / 2 {
+                let item = w.log[(rng.next() as usize) % w.log.len()].clone();
+                rolled.ingest(&item, 0, now);
+                prop_assert!(!rolled.r.forked());
+            }
+        }
+        for (i, item) in w.log.iter().enumerate() {
+            rolled.ingest(item, i as u64 + 1, now);
+        }
+        let original = &w.devs[0];
+        prop_assert!(!rolled.r.forked());
+        prop_assert_eq!(rolled.r.stats().own_ops_missing, 0);
+        prop_assert_eq!(rolled.r.stats().pending, 0);
+        prop_assert_eq!(rolled.r.nodes(), original.r.nodes());
+        prop_assert_eq!(rolled.r.edges(), original.r.edges());
+        prop_assert_eq!(rolled.r.snapshot(), original.r.snapshot());
+        prop_assert_eq!(rolled.r.author(), original.r.author());
+        let position = |d: &Dev| -> Vec<(gsp_wire::Multihash, u64)> {
+            d.r.authors().into_iter().map(|a| (a.author, a.applied_seq)).collect()
+        };
+        prop_assert_eq!(position(&rolled), position(original));
+        prop_assert!(rolled.r.equivocations().is_empty());
+        rolled.check();
+
+        // It writes; a peer that has only ever seen the relay log takes the
+        // op as the next one of the same author.
+        let own_seq = original.r.stats().local;
+        rolled.commit(&[node(77, &["after"], &[("k", int(1))])], now + 1);
+        let fresh: Vec<Vec<u8>> = rolled.drain();
+        let mut peer = Dev::new(9);
+        for item in &w.log {
+            peer.ingest(item, 0, now + 2);
+        }
+        for item in &fresh {
+            let out = peer.ingest(item, 0, now + 2);
+            prop_assert!(matches!(
+                out.status,
+                IngestStatus::Applied | IngestStatus::Duplicate
+            ));
+        }
+        prop_assert_eq!(peer.r.nodes(), rolled.r.nodes());
+        prop_assert_eq!(peer.r.edges(), rolled.r.edges());
+        prop_assert!(peer.r.equivocations().is_empty());
+        let author = rolled.r.author();
+        let seen = peer.r.authors().into_iter().find(|a| a.author == author).unwrap();
+        prop_assert_eq!(seen.applied_seq, own_seq + 1);
+    }
+}
+
 // ---------------------------------------------------------------- faults
 
 /// Gids only the equivocating author writes to.
@@ -519,6 +611,7 @@ proptest! {
             // use, and none is forked.
             for d in &w.devs {
                 prop_assert!(!d.r.forked());
+                prop_assert_eq!(d.r.stats().own_ops_missing, 0);
             }
         }
 

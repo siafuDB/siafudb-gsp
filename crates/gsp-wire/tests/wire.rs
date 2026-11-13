@@ -1111,9 +1111,10 @@ fn sealed_op_round_trip_tamper_and_wrong_key() {
 
 // --------------------------------------------------------------------- batch
 
+#[cfg(feature = "ml-dsa")]
 #[test]
 fn batch_is_signed_as_a_unit() {
-    let a = author(FRAG, HYBRID, 1);
+    let a = author(FRAG, true, 1);
     let b = author(FRAG, false, 2);
     let logs = vec![a.log.clone(), b.log.clone()];
     let ctx = VerifyCtx::new(FRAG, &logs);

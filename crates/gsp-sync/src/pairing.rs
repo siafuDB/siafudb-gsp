@@ -1,7 +1,7 @@
 //! Pairing: the root secret and everything derived from it (SYNC-V0 section 2).
 
 use gsp_wire::FragmentKey;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// BLAKE3 `derive_key` context of the fragment key.
 pub const CTX_FRAGMENT_KEY: &str = "gsp/v0/fragment-key";
@@ -76,13 +76,8 @@ impl Pairing {
     /// Public routing id: the first 16 bytes of
     /// `derive_key("gsp/v0/fragment-id", root)`.
     pub fn fragment_id(&self) -> [u8; FRAGMENT_ID_LEN] {
-        let mut full = blake3::derive_key(CTX_FRAGMENT_ID, &*self.root);
-        let mut id = [0u8; FRAGMENT_ID_LEN];
-        for (o, i) in id.iter_mut().zip(full.iter()) {
-            *o = *i;
-        }
-        full.zeroize();
-        id
+        let full = Zeroizing::new(blake3::derive_key(CTX_FRAGMENT_ID, &*self.root));
+        core::array::from_fn(|i| full[i])
     }
 
     /// Bearer token for the relay at `relay_origin`:
@@ -122,10 +117,9 @@ impl Pairing {
         if body.len() != 43 {
             return Err(PairingError::Length);
         }
-        let mut root = Zeroizing::new([0u8; 32]);
+        let mut decoded: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(33));
         let mut acc: u32 = 0;
         let mut bits = 0u32;
-        let mut out = root.iter_mut();
         for c in body {
             let v = match *c {
                 b'A'..=b'Z' => c - b'A',
@@ -139,9 +133,7 @@ impl Pairing {
             bits += 6;
             if bits >= 8 {
                 bits -= 8;
-                if let Some(o) = out.next() {
-                    *o = (acc >> bits) as u8;
-                }
+                decoded.push((acc >> bits) as u8);
                 acc &= (1 << bits) - 1;
             }
         }
@@ -149,6 +141,12 @@ impl Pairing {
         if acc != 0 {
             return Err(PairingError::NonCanonical);
         }
+        let root: Zeroizing<[u8; 32]> = Zeroizing::new(
+            decoded
+                .as_slice()
+                .try_into()
+                .map_err(|_| PairingError::Length)?,
+        );
         Ok(Pairing { root })
     }
 }

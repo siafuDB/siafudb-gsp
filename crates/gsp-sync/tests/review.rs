@@ -245,50 +245,160 @@ fn state_rollback_is_detected_and_recovered_by_a_new_identity() {
     );
 }
 
-/// Finding 4, the quieter half: the state is rolled back and the device has
-/// not written anything yet. Its own later ops come back from the relay,
-/// beyond its head. They are applied (it gets its data back), and the device
-/// is forked all the same: it cannot know that it has seen all of them.
+/// Rollback without a conflict. The state is rolled back and the device
+/// has not written anything yet. Its own later ops come back from the relay
+/// beyond its head and continue from it: the replica takes them (it gets its
+/// data, its position and its clock back) and carries on as the same author.
 #[test]
-fn own_ops_beyond_the_head_mean_a_rollback_too() {
+fn a_rolled_back_replica_that_pulls_first_fast_forwards() {
     let mut a = Dev::new(1);
     let mut b = Dev::new(2);
     let ga = a.drain();
     statuses(&mut b, &ga, T0);
     let saved = a.r.to_bytes().unwrap();
-    a.commit(&[node(1, &[], &[])], T0);
+    a.commit(&[node(1, &[], &[("v", int(1))])], T0);
     a.commit(&[node(2, &[], &[])], T0 + 1);
+    // Its clock was briefly far ahead for the third.
+    a.commit(&[node(3, &[], &[])], T0 + 90 * 24 * 3_600_000);
     let ops = a.drain();
-    statuses(&mut b, &ops, T0 + 2);
+    let author = a.r.author();
+    let reference = a.r.nodes();
 
     a.r = Replica::from_bytes(&saved, a.config).unwrap();
     a.model = Model::of(&a.r);
-    // Out of order on purpose: the second op first.
+    assert!(a.r.nodes().is_empty());
+    // Out of order on purpose: the second op first. It cannot apply yet,
+    // but it proves the chain goes further than this replica knows.
     assert_eq!(
         a.ingest(&ops[1], 0, T0 + 3).status,
         IngestStatus::Pending(PendingReason::MissingPrev)
     );
-    assert!(a.r.forked());
-    let out = a.ingest(&ops[0], 0, T0 + 3);
-    assert_eq!((out.status, out.applied), (IngestStatus::Applied, 2));
-    assert_eq!(a.r.nodes(), b.r.nodes());
+    assert!(!a.r.forked());
+    assert_eq!(a.r.stats().own_ops_missing, 2);
+    // Writing now would reuse position 1, which is known to be taken.
     assert_eq!(
-        a.try_commit(&[node(3, &[], &[])], T0 + 4).unwrap_err(),
+        a.try_commit(&[node(9, &[], &[])], T0 + 4).unwrap_err(),
+        Error::OwnChainAhead
+    );
+    assert!(a.r.node(&gid(9)).is_none());
+    // That knowledge is part of the state.
+    a.restore();
+    assert_eq!(
+        a.try_commit(&[node(9, &[], &[])], T0 + 4).unwrap_err(),
+        Error::OwnChainAhead
+    );
+
+    // The first op arrives: both apply, with effects, like anyone's ops.
+    let out = a.ingest(&ops[0], 0, T0 + 5);
+    assert_eq!((out.status, out.applied), (IngestStatus::Applied, 2));
+    assert_eq!(
+        out.effects,
+        vec![node(1, &[], &[("v", int(1))]), node(2, &[], &[])]
+    );
+    // The third carries a stamp three months ahead of the clock now. From
+    // anyone else it would be rejected; it is this device's own, and the
+    // chain cannot be rejoined without it.
+    let out = a.ingest(&ops[2], 0, T0 + 5);
+    assert_eq!(out.status, IngestStatus::Applied);
+    assert!(!a.r.forked());
+    assert_eq!(a.r.stats().own_ops_missing, 0);
+    assert_eq!(a.r.nodes(), reference);
+    assert_eq!(a.r.author(), author, "the same author as before");
+    let me = status_of(&a, &author);
+    assert_eq!((me.applied_seq, me.own), (3, true));
+
+    // It writes again: position 4, on top of op 3, with a later HLC even
+    // though the wall clock is three months behind op 3's.
+    a.commit(&[node(4, &[], &[])], T0 + 6);
+    let next = a.drain();
+    assert_eq!(a.r.stats().local, 1);
+    let late = T0 + 91 * 24 * 3_600_000;
+    assert_eq!(
+        statuses(&mut b, &ops, late),
+        [
+            IngestStatus::Applied,
+            IngestStatus::Applied,
+            IngestStatus::Applied
+        ]
+    );
+    assert_eq!(statuses(&mut b, &next, late), [IngestStatus::Applied]);
+    assert_eq!(a.r.nodes(), b.r.nodes());
+    assert_eq!(status_of(&b, &author).applied_seq, 4);
+    assert!(!status_of(&b, &author).equivocated);
+    assert!(b.r.equivocations().is_empty());
+}
+
+/// The same rollback, but the user writes before the first pull. That write
+/// takes a position the device has used before; nothing the replica knows
+/// can prevent it. It is a real conflict, found when the earlier op arrives,
+/// and then the device is forked.
+#[test]
+fn a_rolled_back_replica_that_writes_first_forks() {
+    let mut a = Dev::new(1);
+    let saved = a.r.to_bytes().unwrap();
+    a.commit(&[node(1, &[], &[])], T0);
+    let before = a.drain();
+    a.r = Replica::from_bytes(&saved, a.config).unwrap();
+    a.model = Model::of(&a.r);
+    // Nothing has been seen yet: the commit is accepted.
+    a.commit(&[node(2, &[], &[])], T0 + 1);
+    assert!(!a.r.forked());
+    // First pull.
+    let out = a.ingest(&before[1], 0, T0 + 2);
+    assert_eq!(out.status, IngestStatus::Applied);
+    assert!(a.r.forked());
+    assert_eq!(
+        a.try_commit(&[node(3, &[], &[])], T0 + 3).unwrap_err(),
         Error::Forked
     );
-    // Nothing was written on a branch of its own, so there is nothing to
-    // re-issue: the reset queues the new genesis only.
-    assert_eq!(a.r.reset_identity([0x51; 32], [0x52; 24]).unwrap(), vec![]);
-    assert_eq!(a.r.outbox_len(), 1);
-    a.commit(&[node(3, &[], &[])], T0 + 5);
+    // Both writes are in its graph; the reset re-issues the second.
+    assert!(a.r.node(&gid(1)).is_some() && a.r.node(&gid(2)).is_some());
+    a.r.reset_identity([0x61; 32], [0x62; 24]).unwrap();
+    assert_eq!(status_of(&a, &a.r.author()).applied_seq, 1);
+}
+
+/// An op of the device's own author that claims the next position and does
+/// not continue from its head is a conflict as well: two devices are running
+/// with one seed.
+#[test]
+fn an_own_op_that_does_not_chain_from_the_head_forks() {
+    // A forge with the device's seed is the device's identity.
+    let mut clone = Forge::new(ROOT, 1);
+    let mut a = Dev::new(1);
+    assert_eq!(clone.author(), a.r.author());
+
+    // The clone writes first; the device has written nothing. This is
+    // indistinguishable from the device's own past: fast-forward.
+    let c1 = clone.op(1, None, T0, &[node(1, &[], &[])]);
     assert_eq!(
-        statuses(&mut b, &a.drain(), T0 + 6),
-        [IngestStatus::KeyLog, IngestStatus::Applied]
+        a.ingest(&clone.sealed_op(&c1), 0, T0 + 1).status,
+        IngestStatus::Applied
     );
-    assert_eq!(a.r.nodes(), b.r.nodes());
-    // An op of *another* author beyond its head is the normal case and
-    // forks nobody.
-    assert!(!b.r.forked());
+    assert!(!a.r.forked());
+    // The device writes position 2. So does the clone, differently.
+    a.commit(&[node(2, &[], &[])], T0 + 2);
+    let c2 = clone.op(2, Some(&c1), T0 + 2, &[node(3, &[], &[])]);
+    let c3 = clone.op(3, Some(&c2), T0 + 3, &[node(4, &[], &[])]);
+    // Position 3 arrives first. It waits for position 3's turn; when
+    // evaluated it does not continue from the device's op at 2.
+    let mut d = Dev::new(1);
+    d.ingest(&clone.sealed_op(&c1), 0, T0 + 1);
+    d.commit(&[node(2, &[], &[])], T0 + 2);
+    let out = d.ingest(&clone.sealed_op(&c3), 0, T0 + 4);
+    assert_eq!(
+        out.status,
+        IngestStatus::Rejected(Reject::ChainFork),
+        "claims to follow an op this replica does not hold at 2"
+    );
+    assert!(d.r.forked());
+    // On the first device the conflict shows at position 2 itself.
+    let out = a.ingest(&clone.sealed_op(&c2), 0, T0 + 4);
+    assert_eq!(out.status, IngestStatus::Applied, "the relay's branch is followed");
+    assert!(a.r.forked());
+    assert_eq!(
+        a.try_commit(&[node(5, &[], &[])], T0 + 5).unwrap_err(),
+        Error::Forked
+    );
 }
 
 /// Finding 2 and 3. One device with a clock a year ahead (an honest phone

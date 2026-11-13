@@ -6,6 +6,7 @@ use gsp_wire::*;
 
 const FRAG: &[u8] = b"fragment-A";
 
+#[cfg(feature = "ml-dsa")]
 fn b3(data: &[u8]) -> String {
     hex::encode(Multihash::compute(1, data).unwrap().digest)
 }

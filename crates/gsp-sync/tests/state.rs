@@ -125,7 +125,7 @@ fn state_layout_is_tagged_and_versioned() {
     let items = value_of(&bytes);
     assert_eq!(items.len(), 14);
     assert_eq!(items[0], text("gsp-sync-state"));
-    assert_eq!(items[1], int(1));
+    assert_eq!(items[1], int(2));
     assert_eq!(
         items[2],
         Value::Bytes(ROOT.to_vec()),
@@ -134,12 +134,14 @@ fn state_layout_is_tagged_and_versioned() {
     assert_eq!(items[3], Value::Bytes(vec![1; 32]), "and the device seed");
 
     let mut v = items.clone();
-    v[1] = int(2);
-    assert_eq!(restore(v).unwrap_err(), Error::StateVersion(2));
-    // The layout of the first version of this crate is not read either.
-    let mut v = items.clone();
-    v[1] = int(0);
-    assert_eq!(restore(v).unwrap_err(), Error::StateVersion(0));
+    v[1] = int(3);
+    assert_eq!(restore(v).unwrap_err(), Error::StateVersion(3));
+    // The layouts of earlier versions of this crate are not read either.
+    for old in [0, 1] {
+        let mut v = items.clone();
+        v[1] = int(old);
+        assert_eq!(restore(v).unwrap_err(), Error::StateVersion(old as u64));
+    }
     let mut v = items.clone();
     v[1] = Value::Int(i128::from(u64::MAX));
     assert_eq!(restore(v).unwrap_err(), Error::StateVersion(u64::MAX));

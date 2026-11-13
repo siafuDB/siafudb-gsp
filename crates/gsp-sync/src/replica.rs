@@ -22,7 +22,7 @@ pub const MAX_SEALED_BYTES: usize = 256 * 1024;
 pub const MAX_EQUIVOCATIONS: usize = 64;
 
 const STATE_TAG: &str = "gsp-sync-state";
-const STATE_VERSION: u64 = 1;
+const STATE_VERSION: u64 = 2;
 const CTX_RESET_NONCE: &str = "gsp/v0/reset-identity-nonce";
 
 /// Tunable limits. Not part of the serialised state: pass the same values to
@@ -82,6 +82,13 @@ pub enum Error {
     /// This device's author chain has forked (see [`Replica::forked`]): the
     /// replica refuses to sign. Call [`Replica::reset_identity`].
     Forked,
+    /// The replica has seen ops of this device's own author beyond the ones
+    /// it has applied (its state was rolled back and it is still catching
+    /// up, see [`Replica::forked`]). Signing now would reuse a position that
+    /// is known to be taken. Pull until [`Stats::own_ops_missing`] is 0 and
+    /// try again; if it never gets there (the relay no longer has the
+    /// missing op), call [`Replica::reset_identity`].
+    OwnChainAhead,
     /// State bytes are not a canonical replica state (what was wrong).
     State(&'static str),
     /// State bytes are from a state version this build does not know.
@@ -262,6 +269,10 @@ pub struct Stats {
     pub needs_resync: bool,
     /// [`Replica::forked`].
     pub forked: bool,
+    /// How many ops of this device's own author are known to exist beyond
+    /// the ones applied (after a rollback, while catching up). While it is
+    /// not 0, `local_commit` fails with [`Error::OwnChainAhead`].
+    pub own_ops_missing: u64,
 }
 
 /// What a replica knows about one author (one device).
@@ -393,6 +404,9 @@ struct Outcome {
     seq: u64,
     /// A validly signed op of this device's own identity beyond its head.
     own_ahead: bool,
+    /// A validly signed op of this device's own identity that should be the
+    /// next one and does not continue the chain.
+    own_conflict: bool,
 }
 
 enum Step {
@@ -418,6 +432,9 @@ pub struct Replica {
     clock: Hlc,
     cursor: u64,
     forked: bool,
+    /// Highest `seq` of a validly signed op of this device's own identity
+    /// seen so far (0: none beyond what it wrote itself).
+    own_seen: u64,
     /// An op was dropped for lack of pending space and its author is not one
     /// with a key log (which carry their own flag).
     gap_other: bool,
@@ -518,6 +535,7 @@ impl Replica {
             clock: Hlc::default(),
             cursor: 0,
             forked: false,
+            own_seen: 0,
             gap_other: false,
             authors,
             merge: Merge::default(),
@@ -595,21 +613,42 @@ impl Replica {
     }
 
     /// `true` once the replica has seen proof that this device's author
-    /// chain exists in a version it did not write: a validly signed op of its
-    /// own identity beyond its head, or at a position where it recorded a
-    /// different op.
+    /// chain exists in a version that **conflicts** with the one it holds: a
+    /// validly signed op of its own identity at a position where it recorded
+    /// a different op, or one that claims to be the next op and does not
+    /// continue from its head.
     ///
     /// The cause is a state rollback (a restore from a backup, or state
-    /// saved separately from the push) or a second device running with a
-    /// copy of this one's seed. Either way, signing more ops as this author
-    /// would equivocate, and peers would reject them without anyone being
-    /// told. So [`local_commit`](Replica::local_commit) fails with
-    /// [`Error::Forked`] until [`reset_identity`](Replica::reset_identity)
-    /// gives the device a fresh author.
+    /// saved separately from the push) followed by a local commit, or a
+    /// second device running with a copy of this one's seed. Signing more
+    /// ops as this author would equivocate again, and peers would reject
+    /// them without anyone being told. So
+    /// [`local_commit`](Replica::local_commit) fails with [`Error::Forked`]
+    /// until [`reset_identity`](Replica::reset_identity) gives the device a
+    /// fresh author. Ingest keeps working while forked: the replica follows
+    /// the version of its old chain that the relay has (the one peers hold)
+    /// and keeps the ops it wrote on its own branch for `reset_identity` to
+    /// re-issue.
     ///
-    /// Ingest keeps working while forked. The replica follows the version of
-    /// its old chain that the relay has (the one peers hold) and keeps the
-    /// ops it wrote on its own branch for `reset_identity` to re-issue.
+    /// # Rollback without a conflict: fast-forward
+    ///
+    /// A rolled-back replica that has **not** written anything simply sees
+    /// its own later ops come back from the relay, each continuing from its
+    /// head. Those are applied like anyone's ops (with effects), its own
+    /// head, next `seq` and HLC move forward with them, and it is not forked:
+    /// once it has caught up it writes as before, as the same author.
+    ///
+    /// The replica cannot know how many of its own ops the relay holds. Two
+    /// things keep the window small, and one of them is the application's:
+    ///
+    /// - once an op of its own beyond its head has been *seen* (even one
+    ///   that cannot apply yet because an earlier one is missing),
+    ///   `local_commit` fails with [`Error::OwnChainAhead`] until the chain
+    ///   up to it is applied ([`Stats::own_ops_missing`]);
+    /// - **after restoring state that may be old, pull to the relay's head
+    ///   before the first local commit.** A commit made before that reuses a
+    ///   position; it is detected as a conflict when the earlier op arrives,
+    ///   and then the device is forked.
     pub fn forked(&self) -> bool {
         self.forked
     }
@@ -648,21 +687,14 @@ impl Replica {
             return Err(Error::State("device seed already in use"));
         }
         let nonce = Zeroizing::new(nonce);
+        // Item `i` is sealed under the first 24 bytes of
+        // derive_key(context, caller's nonce ‖ i).
         let nonce_at = |i: u64| -> [u8; 24] {
-            let mut material = Zeroizing::new([0u8; 32]);
-            for (o, b) in material
-                .iter_mut()
-                .zip(nonce.iter().chain(&i.to_le_bytes()))
-            {
-                *o = *b;
-            }
-            let mut full = blake3::derive_key(CTX_RESET_NONCE, &*material);
-            let mut out = [0u8; 24];
-            for (o, b) in out.iter_mut().zip(full.iter()) {
-                *o = *b;
-            }
-            full.zeroize();
-            out
+            let mut material: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(32));
+            material.extend_from_slice(&*nonce);
+            material.extend_from_slice(&i.to_le_bytes());
+            let full = Zeroizing::new(blake3::derive_key(CTX_RESET_NONCE, &material));
+            core::array::from_fn(|k| full[k])
         };
 
         // Ops of the old identity that are not on the chain peers follow.
@@ -727,6 +759,7 @@ impl Replica {
         self.signer = new.signer;
         self.me = new.key;
         self.forked = false;
+        self.own_seen = 0;
         self.authors.insert(new.key, Author::new(new.log));
         self.outbox.push_back(sealed_genesis);
         let mut effects = Vec::new();
@@ -875,9 +908,12 @@ impl Replica {
         if self.forked {
             return Err(Error::Forked);
         }
+        let me = self.authors.get(&self.me).ok_or(Error::State("author"))?;
+        if self.own_seen > me.ops.len() as u64 {
+            return Err(Error::OwnChainAhead);
+        }
         let payload = encode_payload(changes)?;
         let hlc = self.clock.tick(now_ms);
-        let me = self.authors.get(&self.me).ok_or(Error::State("author"))?;
         let op = self.build_op(
             &self.signer,
             self.me,
@@ -1193,8 +1229,12 @@ impl Replica {
         };
         let mut verified = item.verified;
         let mut out = self.evaluate(&item.bytes, &mut verified, now_ms, false);
-        if out.own_ahead || matches!(out.eval, Eval::SelfFork) {
+        if out.own_conflict || matches!(out.eval, Eval::SelfFork) {
             self.forked = true;
+        }
+        if out.own_ahead {
+            // Our own chain is known to reach this far: no signing below it.
+            self.own_seen = self.own_seen.max(out.seq);
         }
         if let Eval::SelfFork = out.eval {
             // Follow the version of our old chain that the relay has, if
@@ -1260,13 +1300,13 @@ impl Replica {
                 let Some(item) = self.forget(order) else {
                     return Step::Duplicate;
                 };
-                // `evaluate` checked the drift bound, so this is `Some`.
-                if let Some(c) = self
+                // `evaluate` checked the drift bound, so this is `Some`,
+                // except for an op of our own (taken whatever its stamp):
+                // there the clock must at least not fall behind our chain.
+                self.clock = self
                     .clock
                     .observe(ready.hlc, now_ms, self.config.max_drift_ms)
-                {
-                    self.clock = c;
-                }
+                    .unwrap_or_else(|| self.clock.max(ready.hlc));
                 effects.extend(self.merge.apply(
                     &ready.changes,
                     Stamp {
@@ -1315,6 +1355,7 @@ impl Replica {
             bucket: None,
             seq: u64::MAX,
             own_ahead: false,
+            own_conflict: false,
         };
         let unverifiable = Eval::Wait(Blocker::Opaque, PendingReason::Unverifiable);
         let op = match Op::from_bytes(signed) {
@@ -1408,14 +1449,23 @@ impl Replica {
                 _ => false,
             };
             if !linked {
+                out.own_conflict = own;
                 return Eval::Drop(Reject::ChainFork);
             }
             // (When adopting, the HLC of the op before is no longer at hand;
             // the replicas that took this branch first checked it.)
             if head > 0 && head == author.ops.len() as u64 && body.hlc <= author.head_hlc {
+                out.own_conflict = own;
                 return Eval::Drop(Reject::HlcNotMonotonic);
             }
-            let lead = body.hlc.wall_ms.saturating_sub(now_ms);
+            // An op of our own was stamped by this device's clock and is
+            // part of a chain we must rejoin before writing again: it is
+            // taken as it is, even if the clock has since been set back.
+            let lead = if own {
+                0
+            } else {
+                body.hlc.wall_ms.saturating_sub(now_ms)
+            };
             if lead > self.config.max_clock_ahead_ms.max(self.config.max_drift_ms) {
                 return Eval::ClockReject {
                     author: author_key,
@@ -1638,6 +1688,9 @@ impl Replica {
             unechoed: self.unechoed.len(),
             needs_resync: self.needs_resync(),
             forked: self.forked,
+            own_ops_missing: self.own_seen.saturating_sub(
+                self.authors.get(&self.me).map_or(0, |a| a.ops.len() as u64),
+            ),
         }
     }
 
@@ -1724,7 +1777,11 @@ impl Replica {
             bytes(&*self.seed),
             hlc_value(self.clock),
             uint(self.cursor),
-            Value::Array(vec![Value::Bool(self.forked), Value::Bool(self.gap_other)]),
+            Value::Array(vec![
+                Value::Bool(self.forked),
+                Value::Bool(self.gap_other),
+                uint(self.own_seen),
+            ]),
             Value::Array(authors),
             self.merge.to_value()?,
             Value::Array(self.pending.values().map(|p| bytes(&p.bytes)).collect()),
@@ -1792,9 +1849,10 @@ impl Replica {
         let mut r = Replica::base(*root, *seed, config)?;
         r.clock = f.value().and_then(hlc_from).ok_or(BAD)?;
         r.cursor = f.u64().ok_or(BAD)?;
-        let mut flags = Fields::exact(f.value().ok_or(BAD)?, 2).ok_or(BAD)?;
+        let mut flags = Fields::exact(f.value().ok_or(BAD)?, 3).ok_or(BAD)?;
         r.forked = flags.bool().ok_or(BAD)?;
         r.gap_other = flags.bool().ok_or(BAD)?;
+        r.own_seen = flags.u64().ok_or(BAD)?;
 
         let mut authors = BTreeMap::new();
         let mut seen = BTreeSet::new();
